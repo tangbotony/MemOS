@@ -21,6 +21,8 @@ from memos.mem_reader.base import BaseMemReader
 from memos.memories.textual.item import TextualMemoryItem, TreeNodeTextualMemoryMetadata
 from memos.parsers.factory import ParserFactory
 from memos.templates.mem_reader_prompts import (
+    SECURITY_EVENT_PATTERN_PROMPT,
+    SECURITY_EVENT_PATTERN_PROMPT_ZH,
     SIMPLE_STRUCT_DOC_READER_PROMPT,
     SIMPLE_STRUCT_DOC_READER_PROMPT_ZH,
     SIMPLE_STRUCT_MEM_READER_EXAMPLE,
@@ -40,6 +42,7 @@ PROMPT_DICT = {
         "zh_example": SIMPLE_STRUCT_MEM_READER_EXAMPLE_ZH,
     },
     "doc": {"en": SIMPLE_STRUCT_DOC_READER_PROMPT, "zh": SIMPLE_STRUCT_DOC_READER_PROMPT_ZH},
+    "security": {"en": SECURITY_EVENT_PATTERN_PROMPT, "zh": SECURITY_EVENT_PATTERN_PROMPT_ZH},
 }
 
 try:
@@ -399,6 +402,8 @@ class SimpleStructMemReader(BaseMemReader, ABC):
             processing_func = self._process_chat_data
         elif type == "doc":
             processing_func = self._process_doc_data
+        elif type == "security":
+            processing_func = self._process_security_data
         else:
             processing_func = self._process_doc_data
 
@@ -500,6 +505,11 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                         results.append({"file": "pure_text", "text": parsed_text})
                 except Exception as e:
                     print(f"Error parsing file {item}: {e!s}")
+        elif type == "security":
+            # For security events, scene_data is a list of message lists
+            # Each message list contains the current event and optionally historical events
+            for items in scene_data:
+                results.append(items)
 
         return results
 
@@ -549,6 +559,187 @@ class SimpleStructMemReader(BaseMemReader, ABC):
 
     def _process_transfer_doc_data(self, raw_node: TextualMemoryItem):
         raise NotImplementedError
+
+    def _process_security_data(self, scene_data_info, info, **kwargs):
+        """
+        Process security monitoring events to extract behavioral patterns.
+        
+        Expected format of scene_data_info:
+        - A list of event messages, where the first one is the current event
+        - Optionally followed by historical similar events for pattern extraction
+        
+        Args:
+            scene_data_info: List of event messages (dicts with 'role' and 'content')
+            info: Dict containing user_id, session_id, and optionally historical_events
+            **kwargs: Additional parameters (mode, etc.)
+        
+        Returns:
+            List of TextualMemoryItem containing extracted patterns
+        """
+        mode = kwargs.get("mode", "fine")
+        
+        if not scene_data_info:
+            logger.warning("[SecurityReader] Empty scene_data_info")
+            return []
+        
+        # Extract current event (first message) and historical events (if provided)
+        current_event = ""
+        historical_events = ""
+        
+        # Build the event strings from messages
+        for msg in scene_data_info:
+            content = msg.get("content", "")
+            if not current_event:
+                # First message is the current event
+                current_event = content
+            else:
+                # Subsequent messages are historical events
+                historical_events += content + "\n"
+        
+        # If no historical events provided in messages, check info dict
+        if not historical_events and "historical_events" in info:
+            historical_events = info["historical_events"]
+        
+        # If still no historical events, treat as a single event record (fast mode)
+        if not historical_events:
+            logger.debug("[SecurityReader] No historical events, storing as single event")
+            return [
+                self._make_memory_item(
+                    value=current_event,
+                    info=info,
+                    memory_type="UserMemory",
+                    tags=["security_event", "single_event"],
+                    sources=[{"type": "security", "content": current_event}],
+                )
+            ]
+        
+        # Use LLM to extract patterns from current + historical events
+        lang = detect_lang(current_event)
+        template = PROMPT_DICT["security"][lang]
+        prompt = template.replace("${current_event}", current_event).replace(
+            "${historical_events}", historical_events
+        )
+        
+        messages = [{"role": "user", "content": prompt}]
+        
+        # 打印完整的 Prompt
+        logger.info("=" * 80)
+        logger.info("🤖 [MemReader] LLM Prompt for Memory Extraction")
+        logger.info("=" * 80)
+        logger.info(f"\n📥 Input Prompt (Language: {lang}):\n")
+        logger.info(prompt)
+        logger.info("\n" + "=" * 80)
+        
+        try:
+            response_text = self.llm.generate(messages)
+            
+            # 打印 LLM 的原始响应
+            logger.info("📤 LLM Raw Response:")
+            logger.info("-" * 80)
+            logger.info(response_text)
+            logger.info("-" * 80)
+            
+            response_json = self.parse_json_result(response_text)
+            
+            # 打印解析后的 JSON
+            import json
+            logger.info("📊 Parsed JSON Result:")
+            logger.info("-" * 80)
+            logger.info(json.dumps(response_json, ensure_ascii=False, indent=2))
+            logger.info("=" * 80 + "\n")
+            
+            # Parse the response and create memory items
+            security_nodes = []
+            for memory_item in response_json.get("memory list", []):
+                try:
+                    memory_type = (
+                        memory_item.get("memory_type", "LongTermMemory")
+                        .replace("长期记忆", "LongTermMemory")
+                        .replace("用户记忆", "UserMemory")
+                    )
+                    if memory_type not in ["LongTermMemory", "UserMemory"]:
+                        memory_type = "LongTermMemory"
+                    
+                    # 获取标准字段
+                    value = memory_item.get("value", "")
+                    tags = memory_item.get("tags", []) + ["security_pattern"]
+                    
+                    # 检查记忆类型（根据标签格式）
+                    is_inference = (
+                        "[推理记忆]" in value or "[Inference Memory]" in value or
+                        "【推测】" in value or "[推测]" in value or "【推理】" in value
+                    )
+                    is_factual = "[实时记忆]" in value or "[Factual Memory]" in value
+                    is_pattern = "[规律记忆]" in value or "[Pattern Memory]" in value
+                    
+                    # 根据记忆类型设置置信度和标签
+                    if is_inference:
+                        tags.append("inference")
+                        confidence_score = 0.75  # 推理内容置信度
+                        mem_type = "inference"
+                    elif is_factual:
+                        tags.append("factual")
+                        confidence_score = 1.0  # 事实记忆置信度
+                        mem_type = "fact"
+                    elif is_pattern:
+                        tags.append("pattern")
+                        confidence_score = 0.85  # 规律记忆置信度
+                        mem_type = "pattern"
+                    else:
+                        confidence_score = 0.80  # 默认置信度
+                        mem_type = "fact"
+                    
+                    # 构建 sources
+                    sources = [{
+                        "type": "security",
+                        "current_event": current_event,
+                        "has_history": bool(historical_events),
+                        "is_inference": is_inference,
+                        "is_pattern": is_pattern,
+                        "is_factual": is_factual,
+                    }]
+                    
+                    node = self._make_memory_item(
+                        value=value,
+                        info=info,
+                        memory_type=memory_type,
+                        tags=tags,
+                        key=memory_item.get("key", ""),
+                        sources=sources,
+                        background=response_json.get("summary", ""),
+                        type_=mem_type,
+                        confidence=confidence_score,
+                    )
+                    security_nodes.append(node)
+                except Exception as e:
+                    logger.error(f"[SecurityReader] Error parsing memory item: {e}")
+            
+            if not security_nodes:
+                logger.warning("[SecurityReader] No patterns extracted, storing current event")
+                return [
+                    self._make_memory_item(
+                        value=current_event,
+                        info=info,
+                        memory_type="UserMemory",
+                        tags=["security_event", "no_pattern"],
+                        sources=[{"type": "security", "content": current_event}],
+                    )
+                ]
+            
+            return security_nodes
+            
+        except Exception as e:
+            logger.error(f"[SecurityReader] LLM generation or parsing failed: {e}")
+            # Fallback: store as single event
+            return [
+                self._make_memory_item(
+                    value=current_event,
+                    info=info,
+                    memory_type="UserMemory",
+                    tags=["security_event", "error_fallback"],
+                    sources=[{"type": "security", "content": current_event}],
+                )
+            ]
 
     def parse_json_result(self, response_text: str) -> dict:
         s = (response_text or "").strip()

@@ -232,12 +232,8 @@ class NaiveAdder(BaseAdder):
         need_update = (
             need_update if isinstance(need_update, bool) else need_update.lower() == "true"
         )
-        update_item = (
-            [mem for mem in retrieved_memories if mem.id == rsp["id"]]
-            if rsp and "id" in rsp
-            else []
-        )
-        if need_update and update_item and rsp:
+        update_item = [mem for mem in retrieved_memories if mem.id == rsp["id"]]
+        if need_update and update_item:
             update_vec_db_item = update_item[0]
             update_vec_db_item.payload[preference_type] = rsp["new_preference"]
             update_vec_db_item.payload["updated_at"] = vec_db_item.payload["updated_at"]
@@ -326,7 +322,7 @@ class NaiveAdder(BaseAdder):
             search_results.sort(key=lambda x: x.score, reverse=True)
 
             return self._update_memory(
-                memory, search_results, collection_name, preference_type, update_mode="fast"
+                memory, search_results, collection_name, preference_type, update_mode="fine"
             )
 
         except Exception as e:

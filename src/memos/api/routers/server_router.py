@@ -1,16 +1,9 @@
-import json
 import os
-import random as _random
-import socket
-import time
 import traceback
 
-from collections.abc import Iterable
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
 
 from memos.api.config import APIConfig
 from memos.api.product_models import (
@@ -39,12 +32,8 @@ from memos.mem_reader.factory import MemReaderFactory
 from memos.mem_scheduler.orm_modules.base_model import BaseDBManager
 from memos.mem_scheduler.scheduler_factory import SchedulerFactory
 from memos.mem_scheduler.schemas.general_schemas import (
-    ADD_LABEL,
-    MEM_READ_LABEL,
-    PREF_ADD_LABEL,
     SearchMode,
 )
-from memos.mem_scheduler.schemas.message_schemas import ScheduleMessageItem
 from memos.memories.textual.prefer_text_memory.config import (
     AdderConfigFactory,
     ExtractorConfigFactory,
@@ -72,16 +61,6 @@ from memos.vec_dbs.factory import VecDBFactory
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/product", tags=["Server API"])
-INSTANCE_ID = f"{socket.gethostname()}:{os.getpid()}:{_random.randint(1000, 9999)}"
-
-
-def _to_iter(running: Any) -> Iterable:
-    """Normalize running tasks to an iterable of task objects."""
-    if running is None:
-        return []
-    if isinstance(running, dict):
-        return running.values()
-    return running  # assume it's already an iterable (e.g., list)
 
 
 def _build_graph_db_config(user_id: str = "default") -> dict[str, Any]:
@@ -254,7 +233,6 @@ def init_server():
         chat_llm=llm,
         process_llm=mem_reader.llm,
         db_engine=BaseDBManager.create_default_sqlite_engine(),
-        mem_reader=mem_reader,
     )
     mem_scheduler.current_mem_cube = naive_mem_cube
     mem_scheduler.start()
@@ -312,7 +290,6 @@ def _format_memory_item(memory_data: Any) -> dict[str, Any]:
     memory["ref_id"] = ref_id
     memory["metadata"]["embedding"] = []
     memory["metadata"]["sources"] = []
-    memory["metadata"]["usage"] = []
     memory["metadata"]["ref_id"] = ref_id
     memory["metadata"]["id"] = memory_id
     memory["metadata"]["memory"] = memory["memory"]
@@ -324,18 +301,17 @@ def _post_process_pref_mem(
     memories_result: list[dict[str, Any]],
     pref_formatted_mem: list[dict[str, Any]],
     mem_cube_id: str,
-    include_preference: bool,
+    handle_pref_mem: bool,
 ):
-    if include_preference:
+    if handle_pref_mem:
         memories_result["pref_mem"].append(
             {
                 "cube_id": mem_cube_id,
                 "memories": pref_formatted_mem,
             }
         )
-        pref_instruction, pref_note = instruct_completion(pref_formatted_mem)
+        pref_instruction: str = instruct_completion(pref_formatted_mem)
         memories_result["pref_string"] = pref_instruction
-        memories_result["pref_note"] = pref_note
 
     return memories_result
 
@@ -355,7 +331,7 @@ def search_memories(search_req: APISearchRequest):
         "act_mem": [],
         "para_mem": [],
         "pref_mem": [],
-        "pref_note": "",
+        "pref_string": "",
     }
 
     search_mode = search_req.mode
@@ -383,7 +359,7 @@ def search_memories(search_req: APISearchRequest):
             return []
         results = naive_mem_cube.pref_mem.search(
             query=search_req.query,
-            top_k=search_req.pref_top_k,
+            top_k=search_req.top_k,
             info={
                 "user_id": search_req.user_id,
                 "session_id": search_req.session_id,
@@ -406,10 +382,7 @@ def search_memories(search_req: APISearchRequest):
     )
 
     memories_result = _post_process_pref_mem(
-        memories_result,
-        pref_formatted_memories,
-        search_req.mem_cube_id,
-        search_req.include_preference,
+        memories_result, pref_formatted_memories, search_req.mem_cube_id, search_req.handle_pref_mem
     )
 
     return SearchResponse(
@@ -504,25 +477,122 @@ def add_memories(add_req: APIADDRequest):
     if not target_session_id:
         target_session_id = "default_session"
 
-    # If text memory backend works in async mode, submit tasks to scheduler
-    try:
-        sync_mode = getattr(naive_mem_cube.text_mem, "mode", "sync")
-    except Exception:
-        sync_mode = "sync"
-    logger.info(f"Add sync_mode mode is: {sync_mode}")
-
     def _process_text_mem() -> list[dict[str, str]]:
+        # Determine the type based on source or default to chat
+        mem_type = "chat"
+        if add_req.source and "security" in add_req.source.lower():
+            mem_type = "security"
+        elif add_req.source and "anker" in add_req.source.lower():
+            mem_type = "security"
+        
+        # For security type, retrieve historical similar events
+        info_dict = {
+            "user_id": add_req.user_id,
+            "session_id": target_session_id,
+        }
+        
+        # 用于存储检索到的历史记忆（用于返回给调用者）
+        retrieved_historical_memories = []
+        
+        if mem_type == "security" and add_req.messages:
+            # Get current event content
+            current_event = add_req.messages[0].get("content", "")
+            
+            # Search for similar historical events
+            try:
+                similar_memories = naive_mem_cube.text_mem.search(
+                    query=current_event,
+                    user_name=user_context.mem_cube_id,
+                    top_k=20,  # 多检索一些，后面会过滤
+                )
+                
+                # 过滤掉推理性内容，保留事实和规律记忆（包括可能不太相关的）
+                filtered_memories = []
+                
+                for mem in similar_memories:
+                    # 获取相似度分数
+                    similarity = getattr(mem, 'similarity', None)
+                    
+                    # 检查是否为推理性内容
+                    is_inference = (
+                        "[推理记忆]" in mem.memory or 
+                        "[Inference Memory]" in mem.memory or
+                        "【推测】" in mem.memory or 
+                        "[推测]" in mem.memory or 
+                        "【推理】" in mem.memory or
+                        "inference" in mem.metadata.tags
+                    )
+                    
+                    # 只保留非推理性内容（事实记忆和规律记忆）
+                    # 注意：不过滤相似度，让 LLM 自己判断是否相关
+                    if not is_inference:
+                        filtered_memories.append(mem)
+                        # 保存用于返回
+                        retrieved_historical_memories.append({
+                            "memory": mem.memory,
+                            "memory_id": mem.id,
+                            "similarity": similarity
+                        })
+                        if len(filtered_memories) >= 8:  # 最多取8个，让 LLM 有更多选择
+                            break
+                
+                # Format historical events for prompt (with timestamps and hour)
+                historical_events = ""
+                for mem in filtered_memories:
+                    # 尝试从 metadata 中获取时间戳
+                    timestamp_info = ""
+                    if hasattr(mem, 'metadata') and hasattr(mem.metadata, 'sources'):
+                        for source in mem.metadata.sources:
+                            if isinstance(source, dict) and 'current_event' in source:
+                                # 从 current_event 中提取时间戳（假设格式包含时间）
+                                current_event = source['current_event']
+                                # 尝试匹配日期时间格式 YYYY-MM-DD HH:MM
+                                import re
+                                datetime_match = re.search(r'(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2})', current_event)
+                                if datetime_match:
+                                    date = datetime_match.group(1)
+                                    hour = datetime_match.group(2)
+                                    minute = datetime_match.group(3)
+                                    # 加上当天小时信息
+                                    timestamp_info = f"[{date} {hour}:{minute} ({hour}h)] "
+                                else:
+                                    # 如果没有时间，至少提取日期
+                                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', current_event)
+                                    if date_match:
+                                        timestamp_info = f"[{date_match.group(1)}] "
+                                break
+                    
+                    # 如果没有找到时间戳，尝试从 created_at 获取
+                    if not timestamp_info and hasattr(mem, 'metadata') and hasattr(mem.metadata, 'created_at'):
+                        created_at = mem.metadata.created_at
+                        if created_at:
+                            # 取日期和小时分钟部分，并加上小时信息
+                            created_str = str(created_at)[:16]
+                            hour_match = re.search(r'(\d{2}):\d{2}$', created_str)
+                            if hour_match:
+                                hour = hour_match.group(1)
+                                timestamp_info = f"[{created_str} ({hour}h)] "
+                            else:
+                                timestamp_info = f"[{created_str}] "
+                    
+                    historical_events += timestamp_info + mem.memory + "\n"
+                
+                if historical_events:
+                    info_dict["historical_events"] = historical_events
+                    logger.info(
+                        f"Retrieved {len(filtered_memories)} non-inference historical events for pattern extraction "
+                        f"(filtered from {len(similar_memories)} total)"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to retrieve historical events: {e}")
+        
         memories_local = mem_reader.get_memory(
             [add_req.messages],
-            type="chat",
-            info={
-                "user_id": add_req.user_id,
-                "session_id": target_session_id,
-            },
-            mode="fast" if sync_mode == "async" else "fine",
+            type=mem_type,
+            info=info_dict,
         )
         flattened_local = [mm for m in memories_local for mm in m]
-        logger.info(f"Memory extraction completed for user {add_req.user_id}")
+        logger.info(f"Memory extraction completed for user {add_req.user_id} using type={mem_type}")
         mem_ids_local: list[str] = naive_mem_cube.text_mem.add(
             flattened_local,
             user_name=user_context.mem_cube_id,
@@ -531,86 +601,46 @@ def add_memories(add_req: APIADDRequest):
             f"Added {len(mem_ids_local)} memories for user {add_req.user_id} "
             f"in session {add_req.session_id}: {mem_ids_local}"
         )
-        if sync_mode == "async":
-            try:
-                message_item_read = ScheduleMessageItem(
-                    user_id=add_req.user_id,
-                    session_id=target_session_id,
-                    mem_cube_id=add_req.mem_cube_id,
-                    mem_cube=naive_mem_cube,
-                    label=MEM_READ_LABEL,
-                    content=json.dumps(mem_ids_local),
-                    timestamp=datetime.utcnow(),
-                    user_name=add_req.mem_cube_id,
-                )
-                mem_scheduler.submit_messages(messages=[message_item_read])
-                logger.info(f"2105Submit messages!!!!!: {json.dumps(mem_ids_local)}")
-            except Exception as e:
-                logger.error(f"Failed to submit async memory tasks: {e}", exc_info=True)
-        else:
-            message_item_add = ScheduleMessageItem(
-                user_id=add_req.user_id,
-                session_id=target_session_id,
-                mem_cube_id=add_req.mem_cube_id,
-                mem_cube=naive_mem_cube,
-                label=ADD_LABEL,
-                content=json.dumps(mem_ids_local),
-                timestamp=datetime.utcnow(),
-                user_name=add_req.mem_cube_id,
-            )
-            mem_scheduler.submit_messages(messages=[message_item_add])
-        return [
-            {
+        
+        # 构建返回结果，包含检索到的历史记忆
+        result_memories = []
+        for memory_id, memory in zip(mem_ids_local, flattened_local, strict=False):
+            mem_dict = {
                 "memory": memory.memory,
                 "memory_id": memory_id,
                 "memory_type": memory.metadata.memory_type,
             }
-            for memory_id, memory in zip(mem_ids_local, flattened_local, strict=False)
-        ]
+            # 如果有检索到的历史记忆，添加到第一个记忆项中
+            if retrieved_historical_memories and len(result_memories) == 0:
+                mem_dict["retrieved_historical_memories"] = retrieved_historical_memories
+            result_memories.append(mem_dict)
+        
+        return result_memories
 
     def _process_pref_mem() -> list[dict[str, str]]:
         if os.getenv("ENABLE_PREFERENCE_MEMORY", "false").lower() != "true":
             return []
-        # Follow async behavior similar to core.py: enqueue when async
-        if sync_mode == "async":
-            try:
-                messages_list = [add_req.messages]
-                message_item_pref = ScheduleMessageItem(
-                    user_id=add_req.user_id,
-                    session_id=target_session_id,
-                    mem_cube_id=add_req.mem_cube_id,
-                    mem_cube=naive_mem_cube,
-                    label=PREF_ADD_LABEL,
-                    content=json.dumps(messages_list),
-                    timestamp=datetime.utcnow(),
-                )
-                mem_scheduler.submit_messages(messages=[message_item_pref])
-                logger.info("Submitted preference add to scheduler (async mode)")
-            except Exception as e:
-                logger.error(f"Failed to submit PREF_ADD task: {e}", exc_info=True)
-            return []
-        else:
-            pref_memories_local = naive_mem_cube.pref_mem.get_memory(
-                [add_req.messages],
-                type="chat",
-                info={
-                    "user_id": add_req.user_id,
-                    "session_id": target_session_id,
-                },
-            )
-            pref_ids_local: list[str] = naive_mem_cube.pref_mem.add(pref_memories_local)
-            logger.info(
-                f"Added {len(pref_ids_local)} preferences for user {add_req.user_id} "
-                f"in session {add_req.session_id}: {pref_ids_local}"
-            )
-            return [
-                {
-                    "memory": memory.memory,
-                    "memory_id": memory_id,
-                    "memory_type": memory.metadata.preference_type,
-                }
-                for memory_id, memory in zip(pref_ids_local, pref_memories_local, strict=False)
-            ]
+        pref_memories_local = naive_mem_cube.pref_mem.get_memory(
+            [add_req.messages],
+            type="chat",
+            info={
+                "user_id": add_req.user_id,
+                "session_id": target_session_id,
+            },
+        )
+        pref_ids_local: list[str] = naive_mem_cube.pref_mem.add(pref_memories_local)
+        logger.info(
+            f"Added {len(pref_ids_local)} preferences for user {add_req.user_id} "
+            f"in session {add_req.session_id}: {pref_ids_local}"
+        )
+        return [
+            {
+                "memory": memory.memory,
+                "memory_id": memory_id,
+                "memory_type": memory.metadata.preference_type,
+            }
+            for memory_id, memory in zip(pref_ids_local, pref_memories_local, strict=False)
+        ]
 
     with ContextThreadPoolExecutor(max_workers=2) as executor:
         text_future = executor.submit(_process_text_mem)
@@ -622,164 +652,6 @@ def add_memories(add_req: APIADDRequest):
         message="Memory added successfully",
         data=text_response_data + pref_response_data,
     )
-
-
-@router.get("/scheduler/status", summary="Get scheduler running status")
-def scheduler_status(user_name: str | None = None):
-    try:
-        if user_name:
-            running = mem_scheduler.dispatcher.get_running_tasks(
-                lambda task: getattr(task, "mem_cube_id", None) == user_name
-            )
-            tasks_iter = list(_to_iter(running))
-            running_count = len(tasks_iter)
-            return {
-                "message": "ok",
-                "data": {
-                    "scope": "user",
-                    "user_name": user_name,
-                    "running_tasks": running_count,
-                    "timestamp": time.time(),
-                    "instance_id": INSTANCE_ID,
-                },
-            }
-        else:
-            running_all = mem_scheduler.dispatcher.get_running_tasks(lambda _t: True)
-            tasks_iter = list(_to_iter(running_all))
-            running_count = len(tasks_iter)
-
-            task_count_per_user: dict[str, int] = {}
-            for task in tasks_iter:
-                cube = getattr(task, "mem_cube_id", "unknown")
-                task_count_per_user[cube] = task_count_per_user.get(cube, 0) + 1
-
-            try:
-                metrics_snapshot = mem_scheduler.dispatcher.metrics.snapshot()
-            except Exception:
-                metrics_snapshot = {}
-
-            return {
-                "message": "ok",
-                "data": {
-                    "scope": "global",
-                    "running_tasks": running_count,
-                    "task_count_per_user": task_count_per_user,
-                    "timestamp": time.time(),
-                    "instance_id": INSTANCE_ID,
-                    "metrics": metrics_snapshot,
-                },
-            }
-    except Exception as err:
-        logger.error("Failed to get scheduler status: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Failed to get scheduler status") from err
-
-
-@router.post("/scheduler/wait", summary="Wait until scheduler is idle for a specific user")
-def scheduler_wait(
-    user_name: str,
-    timeout_seconds: float = 120.0,
-    poll_interval: float = 0.2,
-):
-    """
-    Block until scheduler has no running tasks for the given user_name, or timeout.
-    """
-    start = time.time()
-    try:
-        while True:
-            running = mem_scheduler.dispatcher.get_running_tasks(
-                lambda task: task.mem_cube_id == user_name
-            )
-            running_count = len(running)
-            elapsed = time.time() - start
-
-            # success -> scheduler is idle
-            if running_count == 0:
-                return {
-                    "message": "idle",
-                    "data": {
-                        "running_tasks": 0,
-                        "waited_seconds": round(elapsed, 3),
-                        "timed_out": False,
-                        "user_name": user_name,
-                    },
-                }
-
-            # timeout check
-            if elapsed > timeout_seconds:
-                return {
-                    "message": "timeout",
-                    "data": {
-                        "running_tasks": running_count,
-                        "waited_seconds": round(elapsed, 3),
-                        "timed_out": True,
-                        "user_name": user_name,
-                    },
-                }
-
-            time.sleep(poll_interval)
-
-    except Exception as err:
-        logger.error("Failed while waiting for scheduler: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Failed while waiting for scheduler") from err
-
-
-@router.get("/scheduler/wait/stream", summary="Stream scheduler progress for a user")
-def scheduler_wait_stream(
-    user_name: str,
-    timeout_seconds: float = 120.0,
-    poll_interval: float = 0.2,
-):
-    """
-    Stream scheduler progress via Server-Sent Events (SSE).
-
-    Contract:
-    - We emit periodic heartbeat frames while tasks are still running.
-    - Each heartbeat frame is JSON, prefixed with "data: ".
-    - On final frame, we include status = "idle" or "timeout" and timed_out flag,
-      with the same semantics as /scheduler/wait.
-
-    Example curl:
-      curl -N "${API_HOST}/product/scheduler/wait/stream?timeout_seconds=10&poll_interval=0.5"
-    """
-
-    def event_generator():
-        start = time.time()
-        try:
-            while True:
-                running = mem_scheduler.dispatcher.get_running_tasks(
-                    lambda task: task.mem_cube_id == user_name
-                )
-                running_count = len(running)
-                elapsed = time.time() - start
-
-                payload = {
-                    "user_name": user_name,
-                    "running_tasks": running_count,
-                    "elapsed_seconds": round(elapsed, 3),
-                    "status": "running" if running_count > 0 else "idle",
-                    "instance_id": INSTANCE_ID,
-                }
-                yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
-
-                if running_count == 0 or elapsed > timeout_seconds:
-                    payload["status"] = "idle" if running_count == 0 else "timeout"
-                    payload["timed_out"] = running_count > 0
-                    yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
-                    break
-
-                time.sleep(poll_interval)
-
-        except Exception as e:
-            err_payload = {
-                "status": "error",
-                "detail": "stream_failed",
-                "exception": str(e),
-                "user_name": user_name,
-            }
-            logger.error(f"Scheduler stream error for {user_name}: {traceback.format_exc()}")
-            yield "data: " + json.dumps(err_payload, ensure_ascii=False) + "\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.post("/chat/complete", summary="Chat with MemOS (Complete Response)")

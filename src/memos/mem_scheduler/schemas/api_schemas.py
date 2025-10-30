@@ -35,10 +35,11 @@ class APIMemoryHistoryEntryItem(BaseModel, DictConversionMixin):
     task_status: str = Field(
         default="running", description="Task status: running, completed, failed"
     )
-    session_id: str | None = Field(default=None, description="Optional conversation identifier")
+    conversation_id: str | None = Field(
+        default=None, description="Optional conversation identifier"
+    )
     created_time: datetime = Field(description="Entry creation time", default_factory=get_utc_now)
     timestamp: datetime | None = Field(default=None, description="Timestamp for the entry")
-    conversation_turn: int = Field(default=0, description="Turn count for the same session_id")
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -106,13 +107,11 @@ class APISearchHistoryManager(BaseModel, DictConversionMixin):
         """Get all running task IDs"""
         return self.running_item_ids.copy()
 
-    def get_completed_entries(self) -> list[APIMemoryHistoryEntryItem]:
+    def get_completed_entries(self) -> list[dict[str, Any]]:
         """Get all completed entries"""
         return self.completed_entries.copy()
 
-    def get_history_memory_entries(
-        self, turns: int | None = None
-    ) -> list[APIMemoryHistoryEntryItem]:
+    def get_history_memory_entries(self, turns: int | None = None) -> list[dict[str, Any]]:
         """
         Get the most recent n completed search entries, sorted by created_time.
 
@@ -180,7 +179,7 @@ class APISearchHistoryManager(BaseModel, DictConversionMixin):
         query: str,
         formatted_memories: Any,
         task_status: TaskRunningStatus,
-        session_id: str | None = None,
+        conversation_id: str | None = None,
         memories: list[TextualMemoryItem] | None = None,
     ) -> bool:
         """
@@ -192,7 +191,7 @@ class APISearchHistoryManager(BaseModel, DictConversionMixin):
             query: New query string
             formatted_memories: New formatted memories
             task_status: New task status
-            session_id: New conversation ID
+            conversation_id: New conversation ID
             memories: List of TextualMemoryItem objects
 
         Returns:
@@ -205,8 +204,8 @@ class APISearchHistoryManager(BaseModel, DictConversionMixin):
                 entry.query = query
                 entry.formatted_memories = formatted_memories
                 entry.task_status = task_status
-                if session_id is not None:
-                    entry.session_id = session_id
+                if conversation_id is not None:
+                    entry.conversation_id = conversation_id
                 if memories is not None:
                     entry.memories = memories
 

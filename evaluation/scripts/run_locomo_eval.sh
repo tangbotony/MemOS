@@ -2,7 +2,7 @@
 
 # Common parameters for all scripts
 LIB="memos-api"
-VERSION="default"
+VERSION="072001"
 WORKERS=10
 TOPK=20
 

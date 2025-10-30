@@ -181,9 +181,8 @@ class MemosApiClient:
                 "mem_cube_id": user_id,
                 "conversation_id": "",
                 "top_k": top_k,
-                "mode": os.getenv("SEARCH_MODE", "fast"),
-                "include_preference": True,
-                "pref_top_k": 6,
+                "mode": "mixture",
+                "handle_pref_mem": False,
             },
             ensure_ascii=False,
         )
@@ -233,7 +232,7 @@ class MemosApiOnlineClient:
                 "query": query,
                 "user_id": user_id,
                 "memory_limit_number": top_k,
-                "mode": os.getenv("SEARCH_MODE", "fast"),
+                "mode": "mixture",
             }
         )
 
@@ -246,7 +245,7 @@ class MemosApiOnlineClient:
                 res = json.loads(response.text)["data"]["memory_detail_list"]
                 for i in res:
                     i.update({"memory": i.pop("memory_value")})
-                return {"text_mem": [{"memories": res}], "pref_str": ""}
+                return {"text_mem": [{"memories": res}], "pref_mem": ""}
             except Exception as e:
                 if attempt < max_retries - 1:
                     time.sleep(2**attempt)
@@ -336,19 +335,19 @@ class MemuClient:
 
 if __name__ == "__main__":
     messages = [
-        {"role": "user", "content": "杭州西湖有什么好玩的"},
-        {"role": "assistant", "content": "杭州西湖有好多松鼠，还有断桥"},
+        {"role": "user", "content": "杭州西湖有什么好玩的"}
     ]
-    user_id = "test_user"
+    user_id = "anker_test"
     iso_date = "2023-05-01T00:00:00.000Z"
+    conv_id="000000000000002"
     timestamp = 1682899200
     query = "杭州西湖有什么"
     top_k = 5
 
-    # MEMOS-API
+    # MEMOBASE
     client = MemosApiClient()
     for m in messages:
         m["created_at"] = iso_date
-    client.add(messages, user_id, user_id)
+    client.add(messages, user_id, conv_id=conv_id)
     memories = client.search(query, user_id, top_k)
     print(memories)

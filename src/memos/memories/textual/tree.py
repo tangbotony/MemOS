@@ -16,7 +16,6 @@ from memos.log import get_logger
 from memos.memories.textual.base import BaseTextMemory
 from memos.memories.textual.item import TextualMemoryItem, TreeNodeTextualMemoryMetadata
 from memos.memories.textual.tree_text_memory.organize.manager import MemoryManager
-from memos.memories.textual.tree_text_memory.retrieve.bm25_util import EnhancedBM25
 from memos.memories.textual.tree_text_memory.retrieve.internet_retriever_factory import (
     InternetRetrieverFactory,
 )
@@ -35,8 +34,6 @@ class TreeTextMemory(BaseTextMemory):
         """Initialize memory with the given configuration."""
         # Set mode from class default or override if needed
         self.mode = config.mode
-        logger.info(f"Tree mode is {self.mode}")
-
         self.config: TreeTextMemoryConfig = config
         self.extractor_llm: OpenAILLM | OllamaLLM | AzureLLM = LLMFactory.from_config(
             config.extractor_llm
@@ -46,12 +43,6 @@ class TreeTextMemory(BaseTextMemory):
         )
         self.embedder: OllamaEmbedder = EmbedderFactory.from_config(config.embedder)
         self.graph_store: Neo4jGraphDB = GraphStoreFactory.from_config(config.graph_db)
-
-        self.search_strategy = config.search_strategy
-        self.bm25_retriever = (
-            EnhancedBM25() if self.search_strategy and self.search_strategy["bm25"] else None
-        )
-
         if config.reranker is None:
             default_cfg = RerankerConfigFactory.model_validate(
                 {
@@ -90,18 +81,12 @@ class TreeTextMemory(BaseTextMemory):
         else:
             logger.info("No internet retriever configured")
 
-    def add(
-        self,
-        memories: list[TextualMemoryItem | dict[str, Any]],
-        user_name: str | None = None,
-        **kwargs,
-    ) -> list[str]:
+    def add(self, memories: list[TextualMemoryItem | dict[str, Any]], **kwargs) -> list[str]:
         """Add memories.
         Args:
             memories: List of TextualMemoryItem objects or dictionaries to add.
-            user_name: optional user_name
         """
-        return self.memory_manager.add(memories, user_name=user_name, mode=self.mode)
+        return self.memory_manager.add(memories, mode=self.mode)
 
     def replace_working_memory(self, memories: list[TextualMemoryItem]) -> None:
         self.memory_manager.replace_working_memory(memories)
@@ -121,34 +106,6 @@ class TreeTextMemory(BaseTextMemory):
         This delegates to the MemoryManager.
         """
         return self.memory_manager.get_current_memory_size()
-
-    def get_searcher(
-        self,
-        manual_close_internet: bool = False,
-        moscube: bool = False,
-    ):
-        if (self.internet_retriever is not None) and manual_close_internet:
-            logger.warning(
-                "Internet retriever is init by config , but  this search set manual_close_internet is True  and will close it"
-            )
-            searcher = Searcher(
-                self.dispatcher_llm,
-                self.graph_store,
-                self.embedder,
-                self.reranker,
-                internet_retriever=None,
-                moscube=moscube,
-            )
-        else:
-            searcher = Searcher(
-                self.dispatcher_llm,
-                self.graph_store,
-                self.embedder,
-                self.reranker,
-                internet_retriever=self.internet_retriever,
-                moscube=moscube,
-            )
-        return searcher
 
     def search(
         self,
@@ -192,10 +149,8 @@ class TreeTextMemory(BaseTextMemory):
                 self.graph_store,
                 self.embedder,
                 self.reranker,
-                bm25_retriever=self.bm25_retriever,
                 internet_retriever=None,
                 moscube=moscube,
-                search_strategy=self.search_strategy,
             )
         else:
             searcher = Searcher(
@@ -203,10 +158,8 @@ class TreeTextMemory(BaseTextMemory):
                 self.graph_store,
                 self.embedder,
                 self.reranker,
-                bm25_retriever=self.bm25_retriever,
                 internet_retriever=self.internet_retriever,
                 moscube=moscube,
-                search_strategy=self.search_strategy,
             )
         return searcher.search(query, top_k, info, mode, memory_type, search_filter)
 
@@ -309,21 +262,21 @@ class TreeTextMemory(BaseTextMemory):
     def get_by_ids(self, memory_ids: list[str]) -> list[TextualMemoryItem]:
         raise NotImplementedError
 
-    def get_all(self, user_name: str | None = None) -> dict:
+    def get_all(self) -> dict:
         """Get all memories.
         Returns:
             list[TextualMemoryItem]: List of all memories.
         """
-        all_items = self.graph_store.export_graph(user_name=user_name)
+        all_items = self.graph_store.export_graph()
         return all_items
 
-    def delete(self, memory_ids: list[str], user_name: str | None = None) -> None:
+    def delete(self, memory_ids: list[str]) -> None:
         """Hard delete: permanently remove nodes and their edges from the graph."""
         if not memory_ids:
             return
         for mid in memory_ids:
             try:
-                self.graph_store.delete_node(mid, user_name=user_name)
+                self.graph_store.delete_node(mid)
             except Exception as e:
                 logger.warning(f"TreeTextMemory.delete_hard: failed to delete {mid}: {e}")
 

@@ -2,7 +2,7 @@
 
 # Common parameters for all scripts
 LIB="openai"
-VERSION="default"
+VERSION="063001"
 WORKERS=10
 NUM_RUNS=3
 

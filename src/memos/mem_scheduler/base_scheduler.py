@@ -1,4 +1,3 @@
-import contextlib
 import multiprocessing
 import queue
 import threading
@@ -7,7 +6,6 @@ import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from sqlalchemy.engine import Engine
 
@@ -50,10 +48,6 @@ from memos.memories.activation.kv import KVCacheMemory
 from memos.memories.activation.vllmkv import VLLMKVCacheItem, VLLMKVCacheMemory
 from memos.memories.textual.tree import TextualMemoryItem, TreeTextMemory
 from memos.templates.mem_scheduler_prompts import MEMORY_ASSEMBLY_TEMPLATE
-
-
-if TYPE_CHECKING:
-    from memos.mem_cube.base import BaseMemCube
 
 
 logger = get_logger(__name__)
@@ -130,7 +124,7 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
         self._context_lock = threading.Lock()
         self.current_user_id: UserID | str | None = None
         self.current_mem_cube_id: MemCubeID | str | None = None
-        self.current_mem_cube: BaseMemCube | None = None
+        self.current_mem_cube: GeneralMemCube | None = None
         self.auth_config_path: str | Path | None = self.config.get("auth_config_path", None)
         self.auth_config = None
         self.rabbitmq_config = None
@@ -140,7 +134,6 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
         chat_llm: BaseLLM,
         process_llm: BaseLLM | None = None,
         db_engine: Engine | None = None,
-        mem_reader=None,
     ):
         if process_llm is None:
             process_llm = chat_llm
@@ -156,9 +149,6 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
             self.db_engine = self.monitor.db_engine
             self.dispatcher_monitor = SchedulerDispatcherMonitor(config=self.config)
             self.retriever = SchedulerRetriever(process_llm=self.process_llm, config=self.config)
-
-            if mem_reader:
-                self.mem_reader = mem_reader
 
             if self.enable_parallel_dispatch:
                 self.dispatcher_monitor.initialize(dispatcher=self.dispatcher)
@@ -188,8 +178,6 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
             # Clean up any partially initialized resources
             self._cleanup_on_init_failure()
             raise
-
-        # start queue monitor if enabled and a bot is set later
 
     def _cleanup_on_init_failure(self):
         """Clean up resources if initialization fails."""
@@ -525,10 +513,6 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
                 logger.error(error_msg)
                 raise TypeError(error_msg)
 
-            if getattr(message, "timestamp", None) is None:
-                with contextlib.suppress(Exception):
-                    message.timestamp = datetime.utcnow()
-
             if self.disable_handlers and message.label in self.disable_handlers:
                 logger.info(f"Skipping disabled handler: {message.label} - {message.content}")
                 continue
@@ -543,9 +527,6 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
                 logger.info(
                     f"Submitted message to local queue: {message.label} - {message.content}"
                 )
-        with contextlib.suppress(Exception):
-            if messages:
-                self.dispatcher.on_messages_enqueued(messages)
 
     def _submit_web_logs(
         self, messages: ScheduleLogForWebItem | list[ScheduleLogForWebItem]
@@ -977,41 +958,3 @@ class BaseScheduler(RabbitMQSchedulerModule, RedisSchedulerModule, SchedulerLogg
                 return False
 
         return True
-
-    def _gather_queue_stats(self) -> dict:
-        """Collect queue/dispatcher stats for reporting."""
-        stats: dict[str, int | float | str] = {}
-        stats["use_redis_queue"] = bool(self.use_redis_queue)
-        # local queue metrics
-        if not self.use_redis_queue:
-            try:
-                stats["qsize"] = int(self.memos_message_queue.qsize())
-            except Exception:
-                stats["qsize"] = -1
-            # unfinished_tasks if available
-            try:
-                stats["unfinished_tasks"] = int(
-                    getattr(self.memos_message_queue, "unfinished_tasks", 0) or 0
-                )
-            except Exception:
-                stats["unfinished_tasks"] = -1
-            stats["maxsize"] = int(self.max_internal_message_queue_size)
-            try:
-                maxsize = int(self.max_internal_message_queue_size) or 1
-                qsize = int(stats.get("qsize", 0))
-                stats["utilization"] = min(1.0, max(0.0, qsize / maxsize))
-            except Exception:
-                stats["utilization"] = 0.0
-        # dispatcher stats
-        try:
-            d_stats = self.dispatcher.stats()
-            stats.update(
-                {
-                    "running": int(d_stats.get("running", 0)),
-                    "inflight": int(d_stats.get("inflight", 0)),
-                    "handlers": int(d_stats.get("handlers", 0)),
-                }
-            )
-        except Exception:
-            stats.update({"running": 0, "inflight": 0, "handlers": 0})
-        return stats
