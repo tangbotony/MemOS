@@ -2,6 +2,7 @@ import os
 import traceback
 
 from typing import TYPE_CHECKING, Any
+import re
 
 from fastapi import APIRouter, HTTPException
 
@@ -545,10 +546,9 @@ def add_memories(add_req: APIADDRequest):
                         for source in mem.metadata.sources:
                             if isinstance(source, dict) and 'current_event' in source:
                                 # 从 current_event 中提取时间戳（假设格式包含时间）
-                                current_event = source['current_event']
+                                source_event = source['current_event']  # 修复：使用不同的变量名，避免覆盖外层的 current_event
                                 # 尝试匹配日期时间格式 YYYY-MM-DD HH:MM
-                                import re
-                                datetime_match = re.search(r'(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2})', current_event)
+                                datetime_match = re.search(r'(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2})', source_event)
                                 if datetime_match:
                                     date = datetime_match.group(1)
                                     hour = datetime_match.group(2)
@@ -557,7 +557,7 @@ def add_memories(add_req: APIADDRequest):
                                     timestamp_info = f"[{date} {hour}:{minute} ({hour}h)] "
                                 else:
                                     # 如果没有时间，至少提取日期
-                                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', current_event)
+                                    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', source_event)
                                     if date_match:
                                         timestamp_info = f"[{date_match.group(1)}] "
                                 break
@@ -577,12 +577,22 @@ def add_memories(add_req: APIADDRequest):
                     
                     historical_events += timestamp_info + mem.memory + "\n"
                 
+                # 调试：打印历史事件信息
+                print(f"\n🔍 [Debug] 检索到 {len(filtered_memories)} 条历史记忆")
+                print(f"🔍 [Debug] historical_events 长度: {len(historical_events)} 字符")
+                if historical_events:
+                    print(f"🔍 [Debug] historical_events 前 200 字符: {historical_events[:200]}")
+                else:
+                    print(f"🔍 [Debug] ⚠️ historical_events 为空!")
+                
                 if historical_events:
                     info_dict["historical_events"] = historical_events
                     logger.info(
                         f"Retrieved {len(filtered_memories)} non-inference historical events for pattern extraction "
                         f"(filtered from {len(similar_memories)} total)"
                     )
+                else:
+                    print(f"🔍 [Debug] ⚠️ 没有历史事件被添加到 info_dict")
             except Exception as e:
                 logger.warning(f"Failed to retrieve historical events: {e}")
         

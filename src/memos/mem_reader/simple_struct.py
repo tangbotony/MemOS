@@ -597,11 +597,19 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                 historical_events += content + "\n"
         
         # If no historical events provided in messages, check info dict
+        print(f"\n🔍 [_process_security_data] 检查历史事件...")
+        print(f"🔍 [_process_security_data] historical_events (from messages): {len(historical_events)} 字符")
+        print(f"🔍 [_process_security_data] 'historical_events' in info: {'historical_events' in info}")
+        if "historical_events" in info:
+            print(f"🔍 [_process_security_data] info['historical_events'] 长度: {len(info['historical_events'])} 字符")
+        
         if not historical_events and "historical_events" in info:
             historical_events = info["historical_events"]
+            print(f"🔍 [_process_security_data] ✅ 从 info 中获取到历史事件: {len(historical_events)} 字符")
         
         # If still no historical events, treat as a single event record (fast mode)
         if not historical_events:
+            print(f"🔍 [_process_security_data] ⚠️ 没有历史事件，使用快速模式（直接存储）")
             logger.debug("[SecurityReader] No historical events, storing as single event")
             return [
                 self._make_memory_item(
@@ -609,9 +617,11 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                     info=info,
                     memory_type="UserMemory",
                     tags=["security_event", "single_event"],
-                    sources=[{"type": "security", "content": current_event}],
+                    sources=[{"type": "security", "current_event": current_event}],  # 修复：使用 current_event 字段名保持一致
                 )
             ]
+        
+        print(f"🔍 [_process_security_data] ✅ 有历史事件，将调用 LLM 进行模式提取")
         
         # Use LLM to extract patterns from current + historical events
         lang = detect_lang(current_event)
@@ -623,30 +633,29 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         messages = [{"role": "user", "content": prompt}]
         
         # 打印完整的 Prompt
-        logger.info("=" * 80)
-        logger.info("🤖 [MemReader] LLM Prompt for Memory Extraction")
-        logger.info("=" * 80)
-        logger.info(f"\n📥 Input Prompt (Language: {lang}):\n")
-        logger.info(prompt)
-        logger.info("\n" + "=" * 80)
+        print("\n" + "=" * 80)
+        print("🤖 [MemReader] 发送给 LLM 的完整 Prompt")
+        print("=" * 80)
+        print(f"\n📥 输入 Prompt (语言: {lang}):\n")
+        print(prompt)
+        print("\n" + "=" * 80)
         
         try:
             response_text = self.llm.generate(messages)
             
             # 打印 LLM 的原始响应
-            logger.info("📤 LLM Raw Response:")
-            logger.info("-" * 80)
-            logger.info(response_text)
-            logger.info("-" * 80)
+            print("\n📤 LLM 返回的原始响应:")
+            print("-" * 80)
+            print(response_text)
+            print("-" * 80)
             
             response_json = self.parse_json_result(response_text)
             
             # 打印解析后的 JSON
-            import json
-            logger.info("📊 Parsed JSON Result:")
-            logger.info("-" * 80)
-            logger.info(json.dumps(response_json, ensure_ascii=False, indent=2))
-            logger.info("=" * 80 + "\n")
+            print("\n📊 解析后的 JSON 结果:")
+            print("-" * 80)
+            print(json.dumps(response_json, ensure_ascii=False, indent=2))
+            print("=" * 80 + "\n")
             
             # Parse the response and create memory items
             security_nodes = []
@@ -722,7 +731,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                         info=info,
                         memory_type="UserMemory",
                         tags=["security_event", "no_pattern"],
-                        sources=[{"type": "security", "content": current_event}],
+                        sources=[{"type": "security", "current_event": current_event}],  # 修复：统一字段名
                     )
                 ]
             
@@ -737,7 +746,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                     info=info,
                     memory_type="UserMemory",
                     tags=["security_event", "error_fallback"],
-                    sources=[{"type": "security", "content": current_event}],
+                    sources=[{"type": "security", "current_event": current_event}],  # 修复：统一字段名
                 )
             ]
 
