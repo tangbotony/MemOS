@@ -506,7 +506,12 @@ def add_memories(add_req: APIADDRequest):
                     user_name=user_context.mem_cube_id,
                     top_k=20,  # 多检索一些，后面会过滤
                 )
-                
+                graph_data = naive_mem_cube.text_mem.graph_store.export_graph(user_name=user_context.mem_cube_id, include_embedding=False)
+                print("--------------------------------")
+                print("-------------graph_data-------------------")
+                print(graph_data)
+                print("---------------graph_data end-----------------")
+                print("--------------------------------")
                 # 过滤掉推理性内容，保留事实和规律记忆（包括可能不太相关的）
                 filtered_memories = []
                 
