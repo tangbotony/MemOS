@@ -435,11 +435,14 @@ Output ONLY the following **EXACT JSON structure**; array elements contain ONLY 
 - current_event: Single event, [HH:MM | Role | Scene] + description
 - historical_events: Multiple lines "[YYYY-MM-DD HH:MM (XXh)] + description"
 
-【OUTPUT COUNT (moderate control)】
-- MUST output EXACTLY 1 [Factual Memory] (UserMemory), based on current_event, one sentence; time use "around HH:MM" (if minute unknown, "around HH o'clock"); if unknown, omit time.
-- [Pattern Memory] (LongTermMemory) **2-5 items**: Extract patterns from different dimensions of historical events; output fewer if insufficient evidence.
-- [Inference Memory] (LongTermMemory) **0-2 items**: Only output when sufficient evidence and reasonable inference.
-- Total count **1-8 items** (1 factual + 2-5 patterns + 0-2 inferences), **don't pad if insufficient evidence**.
+【OUTPUT COUNT (strict control)】
+- MUST output EXACTLY 1 [Factual Memory] (UserMemory), based on current_event, one sentence; time use "around HH:MM" (preserve actual time); if time cannot be determined, omit time.
+- [Pattern Memory] (LongTermMemory) **0-3 items**: ONLY output when evidence is STRONG and pattern is CLEAR; don't pad if insufficient evidence.
+  * **PRIORITIZE time-based patterns** (family_commute, door_usage, delivery_pattern with time periods)
+  * Then output attribute-based patterns if space remains
+  * **If unable to extract time-based patterns**, briefly explain in parentheses at the end of an attribute pattern (e.g., "...frequently used (time pattern unavailable: insufficient events across days)")
+- [Inference Memory] (LongTermMemory) **0-1 item**: ONLY output when evidence is VERY STRONG (significantly exceeds pattern threshold) and logical chain is explicit.
+- Total count **1-4 items** (1 factual + 0-3 patterns + 0-1 inference), **strictly require strong evidence, prefer NO output over weak output**.
 
 【ALLOWED KEYS (Extended)】
 Must choose from following keys, each key at most once:
@@ -456,46 +459,55 @@ Must choose from following keys, each key at most once:
 - weather_correlation: Weather-related behavior changes
 - visitor_frequency: Visitor frequency and types
 
-【PERIOD-TYPE THRESHOLDS (moderately relaxed)】
+【PERIOD-TYPE THRESHOLDS (strict, high bar) - HIGHEST PRIORITY】
+**CRITICAL: These patterns MUST include time periods in "HH:MM-HH:MM" format!**
 Applies to: family_commute, door_usage, door_state, delivery_pattern
-- Evidence: Same pattern **≥3 events, spans ≥2 days, from ≥2 different minute values**
-- Aggregation: 60-120 minute windows → output 1-2 non-overlapping intervals (ascending, "HH:MM-HH:MM")
-- Validity: Each segment **≥30 minutes**, start≠end; **strictly forbid** "00:00-00:00"/"09:00-09:00"
-- Any not met → **don't output** this period-type pattern
-- Example: If seeing 3 events "leave at 8:15 AM", "leave at 8:23 AM", "leave at 8:31 AM" spanning 2 days, output "[Pattern Memory] Family members typically leave home between 08:00-09:00 in the morning"
+- Evidence: Same pattern **≥5 events, spans ≥3 days, from ≥3 different dates**
+- Aggregation: 60-120 minute windows → output 1-2 non-overlapping intervals (format: "HH:MM-HH:MM")
+- Validity: Each segment **≥30 minutes**, **start≠end** (start time and end time MUST be different); **strictly forbid** "00:00-00:00"/"08:00-08:00"/"12:00-12:00" etc.
+- **MANDATORY FORMAT**: Pattern value MUST contain "between HH:MM-HH:MM" or "HH:MM-HH:MM" time range
+- **If insufficient evidence**: Don't output this pattern, but may explain reason in parentheses in another pattern (e.g., "insufficient events", "only spans 2 days", "scattered timing")
+- Example: If seeing 5+ events "leave at 8:12 AM", "leave at 8:25 AM", "leave at 8:43 AM" spanning 3+ days, output "[Pattern Memory] Family members typically leave home between 08:00-09:00 in the morning"
 
-【ATTRIBUTE-TYPE THRESHOLDS (moderately relaxed)】
+【ATTRIBUTE-TYPE THRESHOLDS (strict, high bar)】
 Applies to: vehicle, family_composition, recurring_activities, pet, interaction_patterns, child_presence, visitor_frequency
-- Evidence: **≥3 events, spans ≥2 days**
-- **FORBID** "HH:MM-HH:MM" in value
-- Vehicle color/type: Must have **≥60% proportion**, **≥3 samples**, spans **≥2 days** to write color; otherwise only write type without color
-- Example: If seeing 3 "silver SUV" appearances across 2 days, output "[Pattern Memory] Family owns a silver SUV that is frequently used"
+- Evidence: **≥5 events, spans ≥3 days**
+- **FORBID** any time period "HH:MM-HH:MM" in value
+- Vehicle color/type: Must have **≥70% proportion**, **≥5 samples**, spans **≥3 days** to write color; otherwise only write type without color
+- Example: If seeing 5+ "silver SUV" appearances across 3+ days with 70%+ proportion, output "[Pattern Memory] Family owns a silver SUV that is frequently used"
 
-【INFERENCE MEMORY (use cautiously)】
-Only when **≥5 events, spans ≥3 days** and has clear logical chain; otherwise **don't** write [Inference Memory].
-- Inference must be based on multiple confirmed pattern memories
-- Inference content must be reasonable and verifiable
-- Example: If seeing "leave at 8 AM" + "return at 6 PM" + "only on weekdays", can infer "[Inference Memory] Family members likely have fixed working hours, leaving early and returning late on weekdays"
+【INFERENCE MEMORY (extremely strict, use very cautiously)】
+Only when **≥8 events, spans ≥4 days** and has EXPLICIT logical chain; otherwise **don't** write [Inference Memory].
+- Inference MUST be based on MULTIPLE confirmed pattern memories (at least 2 patterns)
+- Inference content must be highly reasonable and verifiable
+- Example: If seeing 8+ events showing "leave between 08:00-09:00" + "return between 18:00-19:00" + "Mon-Fri only", can infer "[Inference Memory] Family members likely have fixed working hours, leaving early and returning late on weekdays"
 
 【DEDUPLICATION & UPDATE】
 - If history already has pattern for same key and current has no new evidence (no new time periods/attributes), **don't** output duplicate
 - If current has significant convergence (more precise time periods) or expansion (new attributes), output updated version
 
 【MULTI-DIMENSIONAL EXTRACTION PRINCIPLES】
+**ALWAYS try to extract time-based patterns FIRST before other types!**
 Priority extraction dimensions (in order):
-1. **Time patterns**: Entry/exit times, activity times (family_commute, door_usage)
+1. **Time patterns (HIGHEST PRIORITY - MUST include time periods)**: 
+   - family_commute (leave_home/return_home with HH:MM-HH:MM)
+   - door_usage (entry times with HH:MM-HH:MM)
+   - delivery_pattern (delivery times with HH:MM-HH:MM)
 2. **Physical features**: Vehicles, pets, people features (vehicle, pet, family_composition)
 3. **Behavior patterns**: Recurring activities, interaction patterns (recurring_activities, interaction_patterns)
-4. **Visitor patterns**: Delivery personnel, visitor frequency (delivery_pattern, visitor_frequency)
+4. **Visitor patterns**: Visitor frequency (visitor_frequency)
 5. **Other patterns**: Weather correlation, door state, etc. (weather_correlation, door_state)
 
 【PRE-GENERATION SELF-CHECK (any fails → don't output that item)】
-- Any Chinese labels / "约HH:MM" / "(XXh)" / "HH:MM" placeholders present?
-- Period-type: Is interval ≥30 minutes, start≠end, ≥2 different minute values, spans ≥2 days?
-- Attribute-type: Mistakenly includes time period?
-- Vehicle color: Meets 60% proportion + samples≥3 + spans≥2 days?
-- Sufficient evidence? (period-type≥3 events, attribute-type≥3 events)
+- Any Chinese labels / "约HH:MM" / "(XXh)" present?
+- **CRITICAL FOR PERIOD-TYPE**: Does the value contain "HH:MM-HH:MM" time range? (family_commute, door_usage, door_state, delivery_pattern MUST have time periods)
+- **CRITICAL**: Period-type intervals have different start and end times (start≠end)? No "12:00-12:00" or "08:00-08:00"?
+- Period-type: Is interval ≥30 minutes, start≠end, ≥5 events, spans ≥3 days, ≥3 different dates?
+- Attribute-type: Mistakenly includes time period? ≥5 events? spans ≥3 days?
+- Vehicle color: Meets 70% proportion + samples≥5 + spans≥3 days?
+- Inference: ≥8 events? spans ≥4 days? Based on multiple confirmed patterns?
 - Different keys not repeated? (each key at most once)
+- **STRONG EVIDENCE**: Is the pattern/inference truly evident and reliable? When in doubt, DON'T output.
 
 【OUTPUT EXAMPLE】
 Assume input:
@@ -508,13 +520,21 @@ Assume input:
   [2024-12-20 09:15 (09h)] Delivery person delivers package to front door
   [2024-12-21 10:23 (10h)] Delivery person delivers package again
 
-Expected output:
+Expected output (assuming sufficient evidence):
 {
   "memory list": [
     {"key": "current_event", "memory_type": "UserMemory", "value": "[Factual Memory] Around 08:23, a man opened the garage door and walked toward a silver SUV"},
     {"key": "family_commute", "memory_type": "LongTermMemory", "value": "[Pattern Memory] Family members typically leave home between 08:00-09:00 in the morning and return between 18:00-19:00 in the afternoon"},
-    {"key": "vehicle", "memory_type": "LongTermMemory", "value": "[Pattern Memory] Family owns a silver SUV that serves as the primary transportation"},
-    {"key": "delivery_pattern", "memory_type": "LongTermMemory", "value": "[Pattern Memory] Delivery personnel typically deliver packages between 09:00-11:00 in the morning"}
+    {"key": "vehicle", "memory_type": "LongTermMemory", "value": "[Pattern Memory] Family owns a silver SUV that serves as the primary transportation"}
+  ]
+}
+
+Alternative output (if time pattern insufficient):
+{
+  "memory list": [
+    {"key": "current_event", "memory_type": "UserMemory", "value": "[Factual Memory] Around 08:23, a man opened the garage door and walked toward a silver SUV"},
+    {"key": "vehicle", "memory_type": "LongTermMemory", "value": "[Pattern Memory] Family owns a silver SUV frequently used for entry/exit (time pattern unavailable: only 3 events across 2 days)"},
+    {"key": "recurring_activities", "memory_type": "LongTermMemory", "value": "[Pattern Memory] Individuals frequently walk between vehicles and residence entrance"}
   ]
 }
 
@@ -542,11 +562,13 @@ SECURITY_EVENT_PATTERN_PROMPT_ZH = r"""
 - current_event：单条，[HH:MM | 角色 | 场景] + 描述
 - historical_events：多行 "[YYYY-MM-DD HH:MM (XX时)] + 描述"
 
-【产出条数（适度控制）】
-- 必须且**仅 1 条** [实时记忆]（UserMemory），基于 current_event，一句话；时间用"约HH:MM"（分钟未知可写"约HH点"）；未知就不写时间。
-- [规律记忆]（LongTermMemory）**2-5 条**：从历史事件中提取不同维度的规律，每个维度一条；若证据不足则少产出。
-- [推理记忆]（LongTermMemory）**0-2 条**：仅在有充分证据且推理合理时产出。
-- 总条数 **1-8 条**（实时1条 + 规律2-5条 + 推理0-2条），**证据不足不凑数**。
+【产出条数（严格控制）】
+- 必须且**仅 1 条** [实时记忆]（UserMemory），基于 current_event，一句话；时间用"约HH:MM"（保留实际时间）；时间不确定就不写时间。
+- [规律记忆]（LongTermMemory）**0-3 条**：仅在证据**强**且规律**明确**时产出；证据不足不产出。
+  * **优先产出时间型规律**（family_commute、door_usage、delivery_pattern 带时间段）
+  * 然后产出属性型规律（如果还有空间）
+- [推理记忆]（LongTermMemory）**0-1 条**：仅在证据**极强**（显著超过规律门槛）且逻辑链**明确**时产出。
+- 总条数 **1-4 条**（实时1条 + 规律0-3条 + 推理0-1条），**严格要求强证据，宁缺毋滥**。
 
 【允许的 key（扩展版）】
 必须从以下key中选择，每个key只产出一次：
@@ -563,46 +585,55 @@ SECURITY_EVENT_PATTERN_PROMPT_ZH = r"""
 - weather_correlation: 天气相关行为变化
 - visitor_frequency: 访客频率和类型
 
-【时段型门槛（适度放宽）】
+【时段型门槛（严格，高标准）- 最高优先级】
+**关键要求：这些规律必须包含 "HH:MM-HH:MM" 格式的时间段！**
 适用：family_commute、door_usage、door_state、delivery_pattern
-- 证据：同一模式 **≥3 次事件、跨 ≥2 天、来自 ≥2 个不同分钟值**
-- 聚合：60–120 分钟窗口 → 输出 1–2 个不重叠区间（升序，"HH:MM-HH:MM"）
-- 合法性：每段 **≥30 分钟**、起止不同；**严禁** "00:00-00:00"/"09:00-09:00"
+- 证据：同一模式 **≥5 次事件、跨 ≥3 天、来自 ≥3 个不同日期**
+- 聚合：60–120 分钟窗口 → 输出 1–2 个不重叠区间（格式："HH:MM-HH:MM"）
+- 合法性：每段 **≥30 分钟**、**起止不同**（起始时间和结束时间必须不同）；**严禁** "00:00-00:00"/"08:00-08:00"/"12:00-12:00" 等
+- **强制格式**：规律的value中必须包含"在HH:MM-HH:MM之间"或"HH:MM-HH:MM"时间范围
 - 任一不满足 → **不产出**该时段型规律
-- 示例：如果看到3次"早上8:15出门"、"早上8:23出门"、"早上8:31出门"，跨2天，可输出"[规律记忆] 家庭成员通常在早上08:00-09:00之间出门"
+- 示例：如果看到5+次"早上8:12出门"、"早上8:25出门"、"早上8:43出门"，跨3+天，可输出"[规律记忆] 家庭成员通常在早上08:00-09:00之间出门"
 
-【属性型门槛（适度放宽）】
+【属性型门槛（严格，高标准）】
 适用：vehicle, family_composition, recurring_activities, pet, interaction_patterns, child_presence, visitor_frequency
-- 证据：**≥3 次事件、跨 ≥2 天**
-- **禁止**在 value 中出现 "HH:MM-HH:MM"
-- 车辆颜色/类型：占比 **≥60%**、样本 **≥3**、跨 **≥2 天**才写颜色；否则只写类型不写颜色
-- 示例：如果看到3次"银色SUV"出现在2天内，可输出"[规律记忆] 家庭拥有一辆银色SUV，经常使用"
+- 证据：**≥5 次事件、跨 ≥3 天**
+- **禁止**在 value 中出现任何时间段 "HH:MM-HH:MM"
+- 车辆颜色/类型：占比 **≥70%**、样本 **≥5**、跨 **≥3 天**才写颜色；否则只写类型不写颜色
+- 示例：如果看到5+次"银色SUV"出现在3+天内且占比70%+，可输出"[规律记忆] 家庭拥有一辆银色SUV，经常使用"
 
-【推理记忆（谨慎使用）】
-仅当 **≥5 次事件、跨 ≥3 天** 且有明确逻辑链时才写；否则**不要**写[推理记忆]。
-- 推理必须基于多个已确认的规律记忆
-- 推理内容必须合理且可验证
-- 示例：如果看到"早上8点出门"+"晚上6点回家"+"工作日才有"，可推理"[推理记忆] 家庭成员可能有固定的工作时间，工作日早出晚归"
+【推理记忆（极其严格，非常谨慎使用）】
+仅当 **≥8 次事件、跨 ≥4 天** 且有**明确**逻辑链时才写；否则**不要**写[推理记忆]。
+- 推理必须基于**多个**已确认的规律记忆（至少2个规律）
+- 推理内容必须高度合理且可验证
+- 示例：如果看到8+次事件显示"08:00-09:00出门"+"18:00-19:00回家"+"仅工作日"，可推理"[推理记忆] 家庭成员可能有固定的工作时间，工作日早出晚归"
 
 【去重与更新】
 - 若历史已存在同 key 的规律且本次无新证据（无新时段/新属性），**不要**重复产出
 - 若本次有显著收敛（时段更精确）或扩展（新属性），则产出更新版本
 
 【多维度抽取原则】
+**始终优先尝试提取时间型规律，然后才考虑其他类型！**
 优先抽取以下维度（按优先级）：
-1. **时间规律**：出入时间、活动时间（family_commute, door_usage）
+1. **时间规律（最高优先级 - 必须包含时间段）**：
+   - family_commute（出入时间，必须带 HH:MM-HH:MM）
+   - door_usage（使用时间，必须带 HH:MM-HH:MM）
+   - delivery_pattern（送货时间，必须带 HH:MM-HH:MM）
 2. **物理特征**：车辆、宠物、人员特征（vehicle, pet, family_composition）
 3. **行为模式**：重复活动、互动模式（recurring_activities, interaction_patterns）
-4. **访客规律**：快递员、访客频率（delivery_pattern, visitor_frequency）
+4. **访客规律**：访客频率（visitor_frequency）
 5. **其他规律**：天气关联、门状态等（weather_correlation, door_state）
 
 【生成前自检（任一不通过→该条不产出）】
-- 是否出现英文标签 / "around HH:MM" / "(XXh)" / "HH:MM"占位符？
-- 时段型：区间是否≥30分钟、起止不同、≥2个不同分钟值且跨≥2天？
-- 属性型：是否误带时间段？
-- 车辆颜色：是否满足 60% 占比 + 样本≥3 + 跨≥2天？
-- 证据是否充分？（时段型≥3次，属性型≥3次）
+- 是否出现英文标签 / "around HH:MM" / "(XXh)"？
+- **时段型关键检查**：value中是否包含"HH:MM-HH:MM"时间范围？（family_commute、door_usage、door_state、delivery_pattern 必须有时间段）
+- **关键检查**：时段型区间的起止时间是否不同（起≠止）？无"12:00-12:00"或"08:00-08:00"？
+- 时段型：区间是否≥30分钟、起止不同、≥5次事件、跨≥3天、≥3个不同日期？
+- 属性型：是否误带时间段？≥5次事件？跨≥3天？
+- 车辆颜色：是否满足 70% 占比 + 样本≥5 + 跨≥3天？
+- 推理：≥8次事件？跨≥4天？基于多个已确认规律？
 - 不同key是否重复？（每个key最多一条）
+- **强证据**：规律/推理是否真实可靠？有疑问时不要产出。
 
 【输出示例】
 假设输入：
@@ -615,15 +646,16 @@ SECURITY_EVENT_PATTERN_PROMPT_ZH = r"""
   [2024-12-20 09:15 (09时)] 快递员送包裹到前门
   [2024-12-21 10:23 (10时)] 快递员再次送包裹
 
-期望输出：
+期望输出（假设有充分证据）：
 {
   "memory list": [
     {"key": "当前事件", "memory_type": "UserMemory", "value": "[实时记忆] 约08:23，一名男子打开车库门并走向银色SUV"},
     {"key": "family_commute", "memory_type": "LongTermMemory", "value": "[规律记忆] 家庭成员通常在早上08:00-09:00之间出门，下午18:00-19:00之间回家"},
-    {"key": "vehicle", "memory_type": "LongTermMemory", "value": "[规律记忆] 家庭拥有一辆银色SUV，是主要出行工具"},
-    {"key": "delivery_pattern", "memory_type": "LongTermMemory", "value": "[规律记忆] 快递员通常在上午09:00-11:00之间送货"}
+    {"key": "vehicle", "memory_type": "LongTermMemory", "value": "[规律记忆] 家庭拥有一辆银色SUV，是主要出行工具"}
   ]
 }
+
+注意：此示例中delivery_pattern未产出，因为仅有2次事件（不满足≥5次事件门槛）
 
 【现在开始】
 - current_event：

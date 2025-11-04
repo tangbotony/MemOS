@@ -269,7 +269,7 @@ def test_add_single_event(family_id: str = "1"):
             print(f"  - 生成的记忆数量: {len(result.data)}")
             for i, mem in enumerate(result.data, 1):
                 print(f"\n  记忆 {i}:")
-                print(f"    - ID: {mem.get('memory_id', 'N/A')[:20]}...")
+                print(f"    - ID: {mem.get('memory_id', 'N/A')}")
                 print(f"    - 类型: {mem.get('memory_type', 'N/A')}")
                 print(f"    - 内容: {mem.get('memory', 'N/A')[:150]}...")
         
@@ -653,7 +653,7 @@ def test_progressive_pattern_extraction(family_id: str = "1", max_events: int = 
                         hist_content = hist_mem.get('memory', 'N/A')
                         hist_id = hist_mem.get('memory_id', 'N/A')
                         log_print(f"\n   历史记忆 {hist_idx}:")
-                        log_print(f"   - ID: {hist_id[:30]}...")
+                        log_print(f"   - ID: {hist_id}")
                         log_print(f"   - 内容: {hist_content}")
                 else:
                     log_print(f"\n🔍 【检索到的历史记忆】 无（首次事件或无相似历史）")
@@ -685,7 +685,7 @@ def test_progressive_pattern_extraction(family_id: str = "1", max_events: int = 
                         memory_label = "🔄 规律性记忆" if is_old_pattern else "📌 原始事件记忆"
                     
                     log_print(f"\n   记忆 {mem_idx}: {memory_label}")
-                    log_print(f"   - ID: {mem_id[:30]}...")
+                    log_print(f"   - ID: {mem_id}")
                     log_print(f"   - 类型: {mem_type}")
                     log_print(f"   - 内容: {mem_content}")
                 

@@ -539,7 +539,7 @@ def add_memories(add_req: APIADDRequest):
                             "memory_id": mem.id,
                             "similarity": similarity
                         })
-                        if len(filtered_memories) >= 8:  # 最多取8个，让 LLM 有更多选择
+                        if len(filtered_memories) >= 20:  # 最多取8个，让 LLM 有更多选择
                             break
                 
                 # Format historical events for prompt (with timestamps and hour)
