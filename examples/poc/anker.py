@@ -29,6 +29,21 @@ logger = get_logger(__name__)
 TEST_DATA_DIR = project_root / "evaluation" / "data" / "anker" / "test_data"
 
 
+class TeeOutput:
+    """同时输出到多个流的类"""
+    def __init__(self, *files):
+        self.files = files
+    
+    def write(self, text):
+        for f in self.files:
+            f.write(text)
+            f.flush()
+    
+    def flush(self):
+        for f in self.files:
+            f.flush()
+
+
 def load_family_events(family_id: str, role_type: str = "General_Identity"):
     """
     加载指定家庭的事件数据，并按时间排序（从早到晚）
@@ -508,7 +523,7 @@ def show_menu():
     print("  0. 退出")
 
 
-def test_progressive_pattern_extraction(family_id: str = "1", max_events: int = 300):
+def test_progressive_pattern_extraction(family_id: str = "1", max_events: int = 300, log_dir=None, batch_timestamp=None):
     """
     渐进式规律提取测试：逐个添加事件，观察规律如何逐渐形成
     
@@ -522,18 +537,25 @@ def test_progressive_pattern_extraction(family_id: str = "1", max_events: int = 
     Args:
         family_id: 家庭ID
         max_events: 最大事件数量
+        log_dir: 日志目录（可选）
+        batch_timestamp: 批次时间戳（可选）
     """
     
-    # 生成带时间戳的 user_id（到分钟）
+    # 生成带时间戳的 user_id
     from datetime import datetime
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    if batch_timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        timestamp = batch_timestamp
+    
     user_id = f"anker_family_{family_id}_{timestamp}"
     mem_cube_id = f"anker_cube_{family_id}_{timestamp}"
     
     # 创建日志文件
-    log_dir = project_root / "examples" / "poc" / "logs"
-    log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / f"debug_family_{family_id}_{timestamp}.log"
+    if log_dir is None:
+        log_dir = project_root / "examples" / "poc" / "logs"
+        log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"family_{family_id}.log"
     
     # 定义日志输出函数
     def log_print(message):
@@ -573,36 +595,6 @@ def test_progressive_pattern_extraction(family_id: str = "1", max_events: int = 
         log_print(f"   - 时间范围: {first_time} → {last_time}")
         log_print(f"   ✅ 事件已按时间从早到晚排序")
     
-    # 打印所有事件列表（按时间排序）
-    log_print("\n" + "=" * 70)
-    log_print(f"📅 所有事件列表（按时间排序，共 {len(events)} 个）")
-    log_print("=" * 70)
-    
-    for idx, event in enumerate(events, 1):
-        timestamp = event.get("timestamp", "N/A")
-        role_type = event.get("role_type", "N/A")
-        key_scene = event.get("key_scene", "N/A")
-        description = event.get("event_description", "N/A")
-        
-        # 检测语言并转换时间
-        language = detect_language(description)
-        time_period = convert_time_to_period(timestamp, language)
-        
-        # 根据角色类型使用不同的图标
-        if role_type == "General Identity":
-            role_icon = "👤"
-        elif role_type == "Staff":
-            role_icon = "📦"
-        else:
-            role_icon = "❓"
-        
-        log_print(f"\n事件 {idx:3d}:")
-        log_print(f"  {role_icon} [{time_period}] {role_type} | {key_scene}")
-        log_print(f"  🕐 时间戳: {timestamp}")
-        # 截断描述，避免太长
-        desc_display = description[:800] + "..." if len(description) > 800 else description
-        log_print(f"  📝 描述: {desc_display}")
-    
     # 用于记录每个阶段的结果
     results_log = []
     
@@ -639,24 +631,14 @@ def test_progressive_pattern_extraction(family_id: str = "1", max_events: int = 
             log_print(f"\n   ✓ 纯描述用于检索和存储（不含元数据前缀）")
             log_print(f"   ✓ 元数据作为标签存储")
             
-            # 添加事件
-            result = add_memories(add_req)
-            
-            # 显示检索到的历史记忆（如果有）
-            if result.data and len(result.data) > 0:
-                first_mem = result.data[0]
-                retrieved_memories = first_mem.get('retrieved_historical_memories', [])
-                
-                if retrieved_memories:
-                    log_print(f"\n🔍 【检索到的历史记忆】 (共 {len(retrieved_memories)} 条)")
-                    for hist_idx, hist_mem in enumerate(retrieved_memories, 1):
-                        hist_content = hist_mem.get('memory', 'N/A')
-                        hist_id = hist_mem.get('memory_id', 'N/A')
-                        log_print(f"\n   历史记忆 {hist_idx}:")
-                        log_print(f"   - ID: {hist_id}")
-                        log_print(f"   - 内容: {hist_content}")
-                else:
-                    log_print(f"\n🔍 【检索到的历史记忆】 无（首次事件或无相似历史）")
+            # 添加事件（重定向stdout到日志文件）
+            old_stdout = sys.stdout
+            with open(log_file, 'a', encoding='utf-8') as log_f:
+                sys.stdout = TeeOutput(old_stdout, log_f)
+                try:
+                    result = add_memories(add_req)
+                finally:
+                    sys.stdout = old_stdout
             
             # 显示生成的记忆
             if result.data:
@@ -837,10 +819,192 @@ def test_progressive_pattern_extraction(family_id: str = "1", max_events: int = 
     return results_log
 
 
+def process_all_families(max_events: int = 300):
+    """
+    循环处理所有家庭的数据，每个家庭独立抽取，独立日志
+    
+    Args:
+        max_events: 每个家庭的最大事件数量
+    """
+    # 为本批次创建唯一的时间戳
+    batch_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 创建本批次的日志目录
+    log_base_dir = project_root / "examples" / "poc" / "logs" / f"batch_{batch_timestamp}"
+    log_base_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 创建总结日志
+    summary_log = log_base_dir / "summary.log"
+    
+    def summary_print(message):
+        """输出到总结日志"""
+        print(message)
+        with open(summary_log, 'a', encoding='utf-8') as f:
+            f.write(message + '\n')
+    
+    summary_print("=" * 70)
+    summary_print("🏠 处理所有家庭的安防数据（每个家庭独立抽取）")
+    summary_print("=" * 70)
+    summary_print(f"\n批次时间戳: {batch_timestamp}")
+    summary_print(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    summary_print(f"批次日志目录: {log_base_dir}")
+    summary_print(f"  - 总结日志: summary.log")
+    summary_print(f"  - 各家庭日志: family_<ID>.log")
+    summary_print(f"每个家庭最大事件数: {max_events}")
+    summary_print(f"\n⚠️  每个家庭使用独立的 user_id 和 mem_cube_id，去重不会跨家庭")
+    summary_print("")
+    
+    # 检测所有可用的家庭数据
+    available_families = []
+    for i in range(1, 11):
+        family_dir = TEST_DATA_DIR / str(i)
+        if family_dir.exists():
+            available_families.append(str(i))
+    
+    summary_print(f"发现 {len(available_families)} 个家庭的数据: {', '.join(available_families)}")
+    summary_print("")
+    
+    # 记录所有家庭的处理结果
+    all_results = {}
+    
+    # 循环处理每个家庭
+    for family_id in available_families:
+        summary_print("\n" + "=" * 70)
+        summary_print(f"开始处理家庭 {family_id}")
+        summary_print("=" * 70)
+        
+        try:
+            # 处理该家庭（传入日志目录和批次时间戳，确保每个家庭独立）
+            results = test_progressive_pattern_extraction(
+                family_id=family_id, 
+                max_events=max_events,
+                log_dir=log_base_dir,
+                batch_timestamp=batch_timestamp
+            )
+            
+            # 统计结果并收集具体内容
+            factual_count = sum(1 for r in results if r.get('is_factual', False))
+            pattern_count = sum(1 for r in results if r['is_pattern'])
+            inference_count = sum(1 for r in results if r.get('is_inference', False))
+            
+            # 收集规律记忆和推理记忆的具体内容
+            pattern_memories_list = [r for r in results if r['is_pattern']]
+            inference_memories_list = [r for r in results if r.get('is_inference', False)]
+            
+            all_results[family_id] = {
+                'total_memories': len(results),
+                'factual_memories': factual_count,
+                'pattern_memories': pattern_count,
+                'inference_memories': inference_count,
+                'pattern_memories_list': pattern_memories_list,
+                'inference_memories_list': inference_memories_list,
+                'status': 'success'
+            }
+            
+            summary_print(f"\n✅ 家庭 {family_id} 处理完成")
+            summary_print(f"   - 总记忆数: {len(results)}")
+            summary_print(f"   - 实时记忆: {factual_count}")
+            summary_print(f"   - 规律记忆: {pattern_count}")
+            summary_print(f"   - 推理记忆: {inference_count}")
+            
+        except Exception as e:
+            summary_print(f"\n❌ 家庭 {family_id} 处理失败: {e}")
+            all_results[family_id] = {
+                'status': 'failed',
+                'error': str(e)
+            }
+            import traceback
+            summary_print(traceback.format_exc())
+    
+    # 输出最终总结
+    summary_print("\n\n" + "=" * 70)
+    summary_print("📊 最终总结")
+    summary_print("=" * 70)
+    
+    successful = [fid for fid, res in all_results.items() if res['status'] == 'success']
+    failed = [fid for fid, res in all_results.items() if res['status'] == 'failed']
+    
+    summary_print(f"\n处理完成:")
+    summary_print(f"   ✅ 成功: {len(successful)} 个家庭")
+    summary_print(f"   ❌ 失败: {len(failed)} 个家庭")
+    
+    if successful:
+        summary_print(f"\n成功处理的家庭统计:")
+        total_memories = 0
+        total_factual = 0
+        total_patterns = 0
+        total_inferences = 0
+        for fid in successful:
+            res = all_results[fid]
+            total_memories += res['total_memories']
+            total_factual += res['factual_memories']
+            total_patterns += res['pattern_memories']
+            total_inferences += res['inference_memories']
+            summary_print(
+                f"   家庭 {fid}: {res['total_memories']} 条记忆 "
+                f"(📌{res['factual_memories']} 实时 | 🔄{res['pattern_memories']} 规律 | 🤔{res['inference_memories']} 推理) "
+                f"- 详见 family_{fid}.log"
+            )
+        
+        summary_print(f"\n总计:")
+        summary_print(f"   - 总记忆数: {total_memories}")
+        summary_print(f"   - 📌 实时记忆: {total_factual}")
+        summary_print(f"   - 🔄 规律记忆: {total_patterns}")
+        summary_print(f"   - 🤔 推理记忆: {total_inferences}")
+        
+        summary_print(f"\n📁 各家庭详细日志:")
+        for fid in successful:
+            summary_print(f"   - 家庭 {fid}: {log_base_dir / f'family_{fid}.log'}")
+        
+        # 输出每个家庭的规律记忆和推理记忆具体内容
+        summary_print(f"\n\n{'='*70}")
+        summary_print("📝 各家庭规律记忆和推理记忆详情")
+        summary_print(f"{'='*70}")
+        
+        for fid in successful:
+            res = all_results[fid]
+            summary_print(f"\n{'─'*70}")
+            summary_print(f"🏠 家庭 {fid}")
+            summary_print(f"{'─'*70}")
+            
+            # 输出规律记忆
+            pattern_list = res.get('pattern_memories_list', [])
+            if pattern_list:
+                summary_print(f"\n🔄 规律记忆 ({len(pattern_list)} 条):")
+                summary_print(f"{'─'*70}")
+                for idx, mem in enumerate(pattern_list, 1):
+                    summary_print(f"\n  [{idx}] {mem.get('memory_type', 'N/A')}")
+                    summary_print(f"      时间: {mem.get('event_time', 'N/A')}")
+                    summary_print(f"      内容: {mem['memory']}")
+            else:
+                summary_print(f"\n🔄 规律记忆: 无")
+            
+            # 输出推理记忆
+            inference_list = res.get('inference_memories_list', [])
+            if inference_list:
+                summary_print(f"\n🤔 推理记忆 ({len(inference_list)} 条):")
+                summary_print(f"{'─'*70}")
+                for idx, mem in enumerate(inference_list, 1):
+                    summary_print(f"\n  [{idx}] {mem.get('memory_type', 'N/A')}")
+                    summary_print(f"      时间: {mem.get('event_time', 'N/A')}")
+                    summary_print(f"      内容: {mem['memory']}")
+            else:
+                summary_print(f"\n🤔 推理记忆: 无")
+        
+        summary_print(f"\n{'='*70}")
+    
+    if failed:
+        summary_print(f"\n失败的家庭: {', '.join(failed)}")
+    
+    summary_print(f"\n结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    summary_print("=" * 70)
+    
+    return all_results
+
+
 if __name__ == "__main__":
-    # 渐进式规律提取测试 - 展示核心价值
-    # 每次运行会自动生成带时间戳的 user_id，无需手动修改
-    test_progressive_pattern_extraction(family_id="1", max_events=300)
+    # 处理所有家庭的数据（每个家庭独立抽取，独立日志）
+    process_all_families(max_events=300)
     # print("\n" + "🎯" * 35)
     # print("Anker 安防场景 - MemOS 直接函数调用调试")
     # print("🎯" * 35)

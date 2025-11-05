@@ -1456,13 +1456,11 @@ class PolarDBGraphDB(BaseGraphDB):
             $$) AS (id agtype)
         """
 
-        # print(f"[get_by_metadata] query: {cypher_query}, where_str: {where_str}")
         ids = []
         try:
             with self.connection.cursor() as cursor:
                 cursor.execute(cypher_query)
                 results = cursor.fetchall()
-                print("[get_by_metadata] result:", results)
                 ids = [str(item[0]).strip('"') for item in results]
         except Exception as e:
             print("Failed to get metadata:", {e})
