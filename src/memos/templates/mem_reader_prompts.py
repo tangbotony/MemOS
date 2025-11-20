@@ -543,6 +543,28 @@ Output:
   ]
 }
 
+【MANDATORY CHECKLIST - Must Complete Before Output】
+⚠️ **You MUST verify each item below before generating JSON, or your output will be rejected**:
+
+□ family_commute verification:
+  1. Did I read EVERY event in historical_events one by one? (Count: __ events)
+  2. Did I identify ALL "leave" event times? (List: __)
+  3. Did I identify ALL "return" event times? (List: __)
+  4. Does output include BOTH "leave" and "return" time ranges?
+  5. Do time ranges cover ALL events?
+
+□ vehicle verification:
+  1. Did I count occurrences for each vehicle color?
+  2. Is my count based on the COMPLETE historical_events?
+  3. Did I only list colors with ≥8 occurrences?
+
+□ family_composition verification:
+  1. Did I iterate through ALL events to record member features?
+  2. Did I include ALL accessories (glasses, hat, etc.)?
+  3. Did I include ALL clothing colors?
+
+✅ Only output JSON after completing ALL checks above!
+
 【INPUT】
 - current_event: ${current_event}
 - historical_events: ${historical_events}
@@ -672,9 +694,31 @@ SECURITY_EVENT_PATTERN_PROMPT_ZH = r"""你正在从智能家居安防事件中�
   ]
 }
 
+【强制检查清单 - 输出前必须完成】
+⚠️ **在生成JSON之前，你必须逐项确认完成以下检查，否则输出将不被接受**：
+
+□ family_commute检查：
+  1. 我是否逐条阅读了historical_events中的每一个事件？（计数：__个事件）
+  2. 我是否识别出了所有"离开"事件的时间？（列表：__）
+  3. 我是否识别出了所有"返回"事件的时间？（列表：__）
+  4. 输出是否同时包含"离开"和"返回"两个时间段？
+  5. 时间范围是否覆盖了所有事件？
+
+□ vehicle检查：
+  1. 我是否统计了每种车辆颜色的出现次数？
+  2. 我的统计是否基于完整的historical_events？
+  3. 我是否只列出了出现≥8次的颜色？
+
+□ family_composition检查：
+  1. 我是否遍历了所有事件，记录了每个成员的特征？
+  2. 我是否包含了所有配饰（眼镜、帽子等）？
+  3. 我是否包含了所有服饰颜色？
+
+✅ 只有当以上所有检查都完成后，才能输出JSON！
+
 【输入】
 - current_event: ${current_event}
 - historical_events: ${historical_events}
 
-只输出 JSON:
+现在，请先完成【强制检查清单】，然后输出 JSON:
 """
