@@ -344,76 +344,91 @@ Return JSON:
     }
 
 
-def save_non_factual_memories(family_id, mem_cube_id, output_dir, family_logger=None):
-    """保存当前家庭的所有非事实记忆（Pattern Memory）
+def _search_memories_for_user(query, mem_cube_id, top_k=2000):
+    """基于 query 和 user，检索记忆并去重"""
+    try:
+        results = naive_mem_cube.text_mem.search(
+            query=query,
+            user_name=mem_cube_id,
+            top_k=top_k,
+        )
+    except Exception as e:
+        logger.warning(f"    ⚠️ 检索记忆失败 ({query}): {e}")
+        return []
     
-    只保留每个类别最新的记忆，删除重复类别的旧记忆
-    
-    Args:
-        family_id: 家庭ID
-        mem_cube_id: 记忆立方体ID
-        output_dir: 输出目录
-        family_logger: 日志记录器
-    """
+    memories = []
+    seen_ids = set()
+    for mem in results or []:
+        mem_id = getattr(mem, "id", None)
+        if not mem_id or mem_id in seen_ids:
+            continue
+        seen_ids.add(mem_id)
+        memories.append({
+            "id": mem_id,
+            "memory": getattr(mem, "memory", ""),
+            "created_at": _get_metadata_value(getattr(mem, "metadata", None), "created_at") or "N/A"
+        })
+    return memories
+
+
+def _filter_memories_by_tags(memories, tags):
+    return [
+        mem for mem in memories
+        if any(tag in mem["memory"] for tag in tags)
+    ]
+
+
+def save_all_memories_and_stats(family_id, mem_cube_id, output_dir, family_logger=None, memory_stats=None):
+    """保存当前家庭的记忆快照（事实/规律/推理）及统计信息"""
     log = family_logger if family_logger else logger
     
     try:
-        # 检索所有 Pattern Memory
-        pattern_memories = naive_mem_cube.text_mem.search(
-            query="[Pattern Memory]",
-            user_name=mem_cube_id,
-            top_k=500,
-        )
+        factual_mems = _search_memories_for_user("[Factual Memory]", mem_cube_id)
+        if not factual_mems:
+            factual_mems = _search_memories_for_user("Ground Truth Label", mem_cube_id)
+        factual_mems = _filter_memories_by_tags(factual_mems, ["[Factual Memory]", "Ground Truth Label"])
         
-        if not pattern_memories:
-            log.info(f"    📝 家庭 {family_id} 暂无非事实记忆")
-            return
+        pattern_mems = _search_memories_for_user("[Pattern Memory]", mem_cube_id)
+        pattern_mems = _filter_memories_by_tags(pattern_mems, ["[Pattern Memory]", "[规律记忆]"])
         
-        # 按维度分组，只保留最新的
-        latest_patterns = {}
-        for mem in pattern_memories:
-            memory_text = getattr(mem, "memory", "")
-            # 跳过已合并的记忆（这些通常是最新的综合版本）
-            if "[Merged]" in memory_text or "MASTER PATTERN" in memory_text:
-                continue
-            
-            key = _extract_pattern_dimension(mem)
-            if not key:
-                key = "unknown_pattern"
-            
-            # 获取创建时间
-            metadata = getattr(mem, "metadata", None)
-            created_at = _get_metadata_value(metadata, "created_at") or ""
-            
-            # 如果这个维度还没有记录，或者当前记忆更新，则更新
-            if key not in latest_patterns or created_at > latest_patterns[key].get("created_at", ""):
-                latest_patterns[key] = {
-                    "memory_id": getattr(mem, "id", "N/A"),
-                    "memory_text": memory_text,
-                    "created_at": created_at,
-                    "dimension": key,
-                }
+        inference_mems = _search_memories_for_user("[Inference Memory]", mem_cube_id)
+        inference_mems = _filter_memories_by_tags(inference_mems, ["[Inference Memory]", "[推理记忆]"])
         
-        # 保存到文件
-        memory_dir = output_dir / "non_factual_memories"
+        memory_dir = output_dir / "memories"
         memory_dir.mkdir(parents=True, exist_ok=True)
-        memory_file = memory_dir / f"{family_id}_patterns.json"
         
-        output_data = {
+        snapshot = {
             "family_id": family_id,
-            "mem_cube_id": mem_cube_id,
-            "total_patterns": len(latest_patterns),
             "timestamp": datetime.now().isoformat(),
-            "patterns": list(latest_patterns.values())
+            "memory_counts": {
+                "factual": len(factual_mems),
+                "pattern": len(pattern_mems),
+                "inference": len(inference_mems),
+                "total_active": len(factual_mems) + len(pattern_mems) + len(inference_mems),
+            },
+            "deletion_stats": memory_stats or {"deletion_ops": 0, "deleted_count": 0},
+            "memories": {
+                "factual": factual_mems,
+                "pattern": pattern_mems,
+                "inference": inference_mems,
+            },
         }
         
-        with open(memory_file, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
+        with open(memory_dir / f"{family_id}_memories.json", 'w', encoding='utf-8') as f:
+            json.dump(snapshot, f, indent=2, ensure_ascii=False)
         
-        log.info(f"    💾 保存了 {len(latest_patterns)} 个非事实记忆到: {memory_file}")
+        log.info(
+            f"    💾 记忆快照已保存: memories/{family_id}_memories.json "
+            f"(Factual={len(factual_mems)}, Pattern={len(pattern_mems)}, Infer={len(inference_mems)})"
+        )
+        if memory_stats:
+            log.info(
+                f"    🧹 删除统计: 操作 {memory_stats.get('deletion_ops', 0)} 次, "
+                f"共删除 {memory_stats.get('deleted_count', 0)} 条记忆"
+            )
         
     except Exception as e:
-        log.error(f"    ❌ 保存非事实记忆失败: {e}")
+        log.error(f"    ❌ 保存记忆快照失败: {e}")
         import traceback
         log.error(traceback.format_exc())
 
@@ -467,7 +482,7 @@ def plot_progress_metrics(progress_log, family_id, output_dir, mode_label, famil
         log.error(traceback.format_exc())
         return None
 
-def clean_duplicate_dimension_memories(mem_cube_id, family_logger=None):
+def clean_duplicate_dimension_memories(mem_cube_id, family_logger=None, memory_stats=None):
     """清理相同维度的重复记忆，只保留最新的
     
     这个函数会检索所有 Pattern Memory，按维度分组，
@@ -476,6 +491,7 @@ def clean_duplicate_dimension_memories(mem_cube_id, family_logger=None):
     Args:
         mem_cube_id: 记忆立方体ID
         family_logger: 日志记录器
+        memory_stats: 统计字典
     """
     log = family_logger if family_logger else logger
     
@@ -527,12 +543,17 @@ def clean_duplicate_dimension_memories(mem_cube_id, family_logger=None):
             if old_ids:
                 try:
                     naive_mem_cube.text_mem.delete(old_ids)
-                    total_deleted += len(old_ids)
+                    deleted_count = len(old_ids)
+                    total_deleted += deleted_count
+                    
+                    if memory_stats is not None:
+                        memory_stats["deletion_ops"] += 1
+                        memory_stats["deleted_count"] += deleted_count
                     
                     log.info(
                         f"    🧹 维度 '{dimension}': 保留最新记忆 "
                         f"(ID: {getattr(latest_mem, 'id', 'N/A')[:8]}...), "
-                        f"删除 {len(old_ids)} 条旧记忆"
+                        f"删除 {deleted_count} 条旧记忆"
                     )
                 except Exception as e:
                     log.warning(f"    ⚠️  删除维度 '{dimension}' 的旧记忆失败: {e}")
@@ -544,8 +565,17 @@ def clean_duplicate_dimension_memories(mem_cube_id, family_logger=None):
         log.warning(f"    ⚠️  清理重复维度记忆时出错: {e}")
 
 
-def add_events_to_memory(events, user_id, mem_cube_id, session_id, phase_info=None, include_labels=False, 
-                        clean_duplicates=True, family_logger=None):
+def add_events_to_memory(
+    events,
+    user_id,
+    mem_cube_id,
+    session_id,
+    phase_info=None,
+    include_labels=False,
+    clean_duplicates=True,
+    family_logger=None,
+    memory_stats=None,
+):
     """批量添加事件到记忆 (包含内容增强 + 进度展示 + 自动去重)
     
     Args:
@@ -553,6 +583,7 @@ def add_events_to_memory(events, user_id, mem_cube_id, session_id, phase_info=No
         include_labels: 是否包含标签（role_type 和 sub_role_type）用于训练学习
         clean_duplicates: 是否在添加后清理相同维度的重复记忆（默认True）
         family_logger: 日志记录器
+        memory_stats: 统计字典，用于记录删除操作次数和数量 {"deletion_ops": 0, "deleted_count": 0}
     """
     log = family_logger if family_logger else logger
     total = len(events)
@@ -580,14 +611,16 @@ Observation: {event['original_description']}"""
             # 我们将身份信息直接嵌入到描述中，使其成为"特征"的一部分
             enhanced_content += f"""
 
-[CRITICAL INSTRUCTION FOR MEMORY EXTRACTION]
-When creating the Pattern Memory, you MUST include the specific identity label.
-DO NOT summarize away the identity.
-Format the Pattern Memory exactly like this:
-"Identity: {sub_role} ({role}) | Visuals: {desc}"
+[Historical Labeled Sample]
+Ground Truth Label: Role={role}, Sub-role={sub_role}
+Visual Context: Matches visual profile for {sub_role}.
 
-Example Output:
-[Pattern Memory] Identity: Family Member | Visuals: Man (black top), Woman (white dress)"""
+[CRITICAL INSTRUCTION FOR MEMORY EXTRACTION]
+1. For the Factual Memory (UserMemory): Embed BOTH the observation text and labels in ONE sentence. Use this template:
+   "[Factual Memory] Time: {time_str} | Observation: {desc} | Ground Truth Label: Role={role}, Sub-role={sub_role}"
+2. Never emit an empty factual memory containing only the label.
+3. For the Pattern Memory: You MUST include the specific identity label. Format it exactly like this:
+   "Identity: {sub_role} ({role}) | Visuals: {desc}" """
         else:
             enhanced_content += f"""
 
@@ -637,7 +670,7 @@ Note: Extract key visual features (clothes, colors), vehicle details, and behavi
     # 清理相同维度的重复记忆
     if clean_duplicates:
         log.info(f"    🔍 检查并清理相同维度的重复记忆...")
-        clean_duplicate_dimension_memories(mem_cube_id, family_logger=log)
+        clean_duplicate_dimension_memories(mem_cube_id, family_logger=log, memory_stats=memory_stats)
     
     return elapsed
 
@@ -645,7 +678,7 @@ def infer_event(event, user_id, mem_cube_id):
     """推理单个事件（包含检索记忆）
     
     Returns:
-        tuple: (role_type, sub_role_type, confidence, reasoning, retrieved_memories)
+        tuple: (role_type, sub_role_type, confidence, reasoning, retrieved_memories, prompt)
     """
     desc = event['original_description']
     ts = event['timestamp']
@@ -654,13 +687,17 @@ def infer_event(event, user_id, mem_cube_id):
     
     # 先检索相关记忆
     retrieved_memories = []
+    few_shot_examples = []
+    learned_prototypes = []
+    
     try:
-        # 优化检索 Query：同时寻找相似事件和身份规则
-        search_query = f"Identity rules and visual patterns for: {desc[:200]}"
+        # 1. 检索相似事件（用于 Few-Shot）
+        # 使用描述检索具体的历史事件
+        search_query = f"Similar event: {desc[:200]}"
         memories = naive_mem_cube.text_mem.search(
             query=search_query,
             user_name=mem_cube_id,
-            top_k=10,
+            top_k=15,  # 增加数量以筛选高质量样本
         )
         
         for mem in memories:
@@ -669,28 +706,59 @@ def infer_event(event, user_id, mem_cube_id):
             metadata = getattr(mem, "metadata", None)
             created_at = _get_metadata_value(metadata, "created_at") or "N/A"
             
+            # 分类记忆类型
+            is_pattern = "[Pattern Memory]" in mem_text
+            is_gt_sample = "Ground Truth Label" in mem_text or "[Historical Labeled Sample]" in mem_text
+            
+            # 收集 Few-Shot 样本 (必须包含 GT 标签)
+            if is_gt_sample:
+                few_shot_examples.append(mem_text)
+            
+            # 收集原型 (Pattern Memory)
+            if is_pattern and ("Identity:" in mem_text or "Visuals:" in mem_text):
+                learned_prototypes.append(mem_text)
+            
+            # 记录检索到的所有相关记忆（用于调试和分析）
             retrieved_memories.append({
                 "memory_id": mem_id,
                 "memory_text": mem_text[:500],  # 截断太长的记忆
-                "created_at": created_at
+                "created_at": created_at,
+                "type": "Pattern" if is_pattern else ("GT Sample" if is_gt_sample else "Other")
             })
+            
+        # 限制数量
+        few_shot_examples = few_shot_examples[:5]
+        learned_prototypes = learned_prototypes[:5]
+            
     except Exception as e:
         logger.warning(f"Failed to retrieve memories: {e}")
     
+    # 构建增强 Prompt
+    few_shot_block = ""
+    if few_shot_examples:
+        few_shot_block = "\n[Historical Similar Events (Few-Shot Examples)]\n" + "\n".join([f"{i+1}. {m}" for i, m in enumerate(few_shot_examples)])
+        
+    prototype_block = ""
+    if learned_prototypes:
+        prototype_block = "\n[Learned Identity Prototypes]\n" + "\n".join([f"- {p}" for p in learned_prototypes])
+
     query = f"""Based on the learned family history and identity patterns, infer the identity for this security event.
+{prototype_block}
+{few_shot_block}
 
 Current Event:
 - Time: {fmt_time} ({period})
 - Description: {desc}
 
 Analysis Instructions:
-1. Review learned patterns from historical data. Look for memories that explicitly state "Identity: ..." associated with specific visual features.
-2. Compare current event with learned identity categories:
+1. FIRST, check [Learned Identity Prototypes] for direct matches.
+2. SECOND, compare with [Historical Similar Events]. If the current event visually resembles a historical example labeled as "Family Member", adopt that label.
+3. Compare current event with learned identity categories:
    - Role Type: General Identity / Passerby / Staff / Suspicious Person / Unspecified / Non-Human
    - Sub-role Type: Family Member / Visitor / Delivery Person / Other General Identity / Critical Non-Human Event / etc.
 
-3. Pay special attention to:
-   - VISUAL MATCHING: If the current person's appearance matches a past memory formatted like "Identity: Family Member | Visuals: [Description]", then confidently apply that identity.
+4. Pay special attention to:
+   - VISUAL MATCHING: Confidence should be HIGH if visuals match a Prototype or a Historical Example.
    - Time of day patterns (e.g., family members at certain times)
    - Contextual clues (e.g., delivery uniforms for staff)
    - Behavioral consistency with learned patterns
@@ -699,15 +767,15 @@ Output format (strict):
 role_type: [TYPE]
 sub_role_type: [SUBTYPE]
 confidence: [High/Medium/Low]
-reasoning: [Brief explanation referencing learned patterns and visual/contextual clues]
+reasoning: [Brief explanation referencing specific prototypes or examples if matched]
 """
     try:
         response = llm.generate([{"role": "user", "content": query}])
         role, sub, conf, reasoning = parse_result(response)
-        return role, sub, conf, reasoning, retrieved_memories
+        return role, sub, conf, reasoning, retrieved_memories, query
     except Exception as e:
         logger.error(f"Inference failed: {e}")
-        return "Unspecified", "Unspecified", "Low", "", retrieved_memories
+        return "Unspecified", "Unspecified", "Low", "", retrieved_memories, query
 
 def parse_result(text):
     role = "Unspecified"
@@ -726,42 +794,24 @@ def parse_result(text):
     
     return role, sub, conf, text
 
-def analyze_evaluation_results(all_eval_results, family_id, output_dir, family_logger=None):
-    """分析所有评估结果，找出抽取好的和不好的样本
-    
-    Args:
-        all_eval_results: 所有评估阶段的结果列表
-        family_id: 家庭ID
-        output_dir: 输出目录
-        family_logger: 日志记录器
-    """
-    log = family_logger if family_logger else logger
-    
-    log.info(f"\n{'='*80}")
-    log.info(f"📊 最终评估分析 - 家庭 {family_id}")
-    log.info(f"{'='*80}")
-    
-    # 收集所有预测结果（使用最后一次评估）
-    if not all_eval_results:
-        log.warning("  ⚠️  没有评估结果可供分析")
-        return
-    
-    last_eval = all_eval_results[-1]
-    predictions = last_eval.get("predictions", [])
-    ground_truths = last_eval.get("ground_truths", {})
-    
-    # 分类结果
-    correct_predictions = []
-    wrong_role_type = []
-    wrong_sub_role_type = []
-    wrong_both = []
+def _partition_predictions(predictions, ground_truths):
+    """将预测结果按正确/错误类型分组"""
+    partitions = {
+        "correct": [],
+        "wrong_role_type": [],
+        "wrong_sub_role_type": [],
+        "wrong_both": [],
+        "total": 0,
+    }
     
     for pred in predictions:
         vid = pred['video_path']
-        if vid not in ground_truths:
+        gt = ground_truths.get(vid)
+        if not gt:
             continue
         
-        gt = ground_truths[vid]
+        partitions["total"] += 1
+        
         p_role = pred['predicted_role_type'].strip().lower()
         p_sub = pred['predicted_sub_role_type'].strip().lower()
         g_role = gt['role_type'].strip().lower()
@@ -788,16 +838,159 @@ def analyze_evaluation_results(all_eval_results, family_id, output_dir, family_l
         }
         
         if role_correct and sub_correct:
-            correct_predictions.append(comparison)
+            partitions["correct"].append(comparison)
         elif not role_correct and not sub_correct:
-            wrong_both.append(comparison)
+            partitions["wrong_both"].append(comparison)
         elif not role_correct:
-            wrong_role_type.append(comparison)
-        else:  # not sub_correct
-            wrong_sub_role_type.append(comparison)
+            partitions["wrong_role_type"].append(comparison)
+        else:
+            partitions["wrong_sub_role_type"].append(comparison)
     
-    total = len(predictions)
-    correct_count = len(correct_predictions)
+    return partitions
+
+
+def _build_analysis_summary(partitions):
+    """基于分组结果生成深度分析摘要"""
+    total = partitions["total"]
+    correct = len(partitions["correct"])
+    wrong_role = len(partitions["wrong_role_type"])
+    wrong_sub = len(partitions["wrong_sub_role_type"])
+    wrong_both = len(partitions["wrong_both"])
+    
+    all_wrong = partitions["wrong_role_type"] + partitions["wrong_sub_role_type"] + partitions["wrong_both"]
+    role_related_errors = partitions["wrong_role_type"] + partitions["wrong_both"]
+    sub_related_errors = partitions["wrong_sub_role_type"] + partitions["wrong_both"]
+    
+    avg_retrieved = sum(s['retrieved_memories_count'] for s in all_wrong) / len(all_wrong) if all_wrong else 0
+    zero_retrieval = sum(1 for s in all_wrong if s['retrieved_memories_count'] == 0)
+    min_retrieved = min((s['retrieved_memories_count'] for s in all_wrong), default=0)
+    max_retrieved = max((s['retrieved_memories_count'] for s in all_wrong), default=0)
+    zero_ratio = (zero_retrieval / len(all_wrong)) if all_wrong else 0
+    
+    def _extract_confusions(records, label):
+        counter = defaultdict(int)
+        for rec in records:
+            gt = rec['ground_truth'].get(label, "Unknown")
+            pred = rec['predicted'].get(label, "Unknown")
+            if gt == pred:
+                continue
+            counter[(gt, pred)] += 1
+        sorted_pairs = sorted(counter.items(), key=lambda x: x[1], reverse=True)[:5]
+        return [
+            {"from": pair[0], "to": pair[1], "count": count}
+            for (pair, count) in sorted_pairs
+        ]
+    
+    role_confusions = _extract_confusions(role_related_errors, "role_type")
+    sub_confusions = _extract_confusions(sub_related_errors, "sub_role_type")
+    
+    # 提取高频视觉关键词（支持中英文）
+    confusion_keywords = defaultdict(int)
+    stop_words = {'the', 'a', 'an', 'in', 'on', 'at', 'of', 'with', 'and', 'to', 'is', 'are',
+                  'wearing', 'dressed', 'scene', 'near', 'from', 'toward', 'into', 'person', 'people'}
+    for err in all_wrong:
+        desc = err['description']
+        if not desc or desc == 'N/A':
+            continue
+        words = re.findall(r'[a-zA-Z]{3,}', desc.lower())
+        chinese_tokens = re.findall(r'[\u4e00-\u9fff]{1,2}', desc)
+        for w in words:
+            if w not in stop_words:
+                confusion_keywords[w] += 1
+        for token in chinese_tokens:
+            confusion_keywords[token] += 1
+    
+    top_keywords = sorted(confusion_keywords.items(), key=lambda x: x[1], reverse=True)[:5]
+    if not top_keywords and all_wrong:
+        top_keywords = [{"keyword": "描述不足，无法提取视觉模式", "count": len(all_wrong)}]
+    elif not top_keywords:
+        top_keywords = [{"keyword": "全部预测正确，无视觉混淆", "count": 0}]
+    
+    suggestions = []
+    
+    if not all_wrong:
+        suggestions.append("验证集中样本全部预测正确，可增加困难样本验证泛化。")
+    else:
+        role_error_ratio = len(role_related_errors) / len(all_wrong)
+        sub_error_ratio = len(sub_related_errors) / len(all_wrong)
+        
+        if zero_ratio > 0.3:
+            suggestions.append("检索召回不足：超过30%的错误样本未检索到记忆，需检查向量索引或增大 top_k。")
+        if avg_retrieved > 3 and len(partitions["wrong_both"]) / len(all_wrong) > 0.5:
+            suggestions.append("推理一致性较差：检索数量充足但仍大量错误，建议优化 Prompt 或提升 Pattern Memory 质量。")
+        if role_error_ratio >= 0.4:
+            top_pair = role_confusions[0] if role_confusions else None
+            detail = f"Top: {top_pair['from']}→{top_pair['to']}" if top_pair else "Top: N/A"
+            suggestions.append(f"身份大类混淆占比高（{role_error_ratio*100:.1f}%）。{detail}")
+        if sub_error_ratio >= 0.4:
+            top_pair = sub_confusions[0] if sub_confusions else None
+            detail = f"Top: {top_pair['from']}→{top_pair['to']}" if top_pair else "Top: N/A"
+            suggestions.append(f"身份子类混淆占比高（{sub_error_ratio*100:.1f}%）。{detail}")
+        def _kw_label(item):
+            if isinstance(item, dict):
+                return item.get("keyword", "")
+            return item[0]
+        
+        if any(_kw_label(k) in {"black", "dark", "blue", "white"} for k in top_keywords):
+            suggestions.append("视觉特征过于依赖颜色，建议在描述中加入服饰细节或物品特征以增强区分度。")
+        if not suggestions:
+            suggestions.append("错误样本数量有限，建议扩展验证集或主动标注以暴露更多失败模式。")
+    
+    summary = {
+        "overview": {
+            "total": total,
+            "correct": correct,
+            "accuracy": (correct / total) if total else 0,
+            "wrong_role_only": wrong_role,
+            "wrong_sub_only": wrong_sub,
+            "wrong_both": wrong_both,
+        },
+        "retrieval_quality": {
+            "avg_retrieved_for_errors": avg_retrieved,
+            "min_retrieved_for_errors": min_retrieved,
+            "max_retrieved_for_errors": max_retrieved,
+            "zero_retrieval_ratio": zero_ratio,
+        },
+        "visual_confusion_keywords": [
+            item if isinstance(item, dict) else {"keyword": item[0], "count": item[1]}
+            for item in top_keywords
+        ],
+        "dominant_confusions": {
+            "role_type": role_confusions,
+            "sub_role_type": sub_confusions,
+        },
+        "suggestions": suggestions,
+    }
+    
+    return summary
+
+
+def analyze_evaluation_results(all_eval_results, family_id, output_dir, family_logger=None):
+    """分析所有评估结果，找出抽取好的和不好的样本"""
+    log = family_logger if family_logger else logger
+    
+    log.info(f"\n{'='*80}")
+    log.info(f"📊 最终评估分析 - 家庭 {family_id}")
+    log.info(f"{'='*80}")
+    
+    # 收集所有预测结果（使用最后一次评估）
+    if not all_eval_results:
+        log.warning("  ⚠️  没有评估结果可供分析")
+        return
+    
+    last_eval = all_eval_results[-1]
+    predictions = last_eval.get("predictions", [])
+    ground_truths = last_eval.get("ground_truths", {})
+    
+    partitions = _partition_predictions(predictions, ground_truths)
+    summary = _build_analysis_summary(partitions)
+    
+    total = summary["overview"]["total"]
+    correct_count = summary["overview"]["correct"]
+    wrong_role_type = partitions["wrong_role_type"]
+    wrong_sub_role_type = partitions["wrong_sub_role_type"]
+    wrong_both = partitions["wrong_both"]
+    correct_predictions = partitions["correct"]
     
     # 输出统计
     log.info(f"\n  ✅ 完全正确: {correct_count}/{total} ({correct_count/total*100:.1f}%)")
@@ -831,7 +1024,16 @@ def analyze_evaluation_results(all_eval_results, family_id, output_dir, family_l
         log.info(f"\n    Sub-role Type 混淆矩阵 (Top 5):")
         for pattern, count in sorted(error_patterns.items(), key=lambda x: x[1], reverse=True)[:5]:
             log.info(f"      • {pattern}: {count}次")
-    
+
+    log.info(f"\n  🧠 深度错误归因分析:")
+    log.info(f"    • 错误样本平均检索记忆数: {summary['retrieval_quality']['avg_retrieved_for_errors']:.1f}")
+    log.info(f"    • 无记忆检索样本占比: {summary['retrieval_quality']['zero_retrieval_ratio']*100:.1f}%")
+    if summary["visual_confusion_keywords"]:
+        keywords_str = ", ".join([f"{item['keyword']}({item['count']})" for item in summary["visual_confusion_keywords"]])
+        log.info(f"    • 高频混淆视觉特征词: {keywords_str}")
+    for sug in summary["suggestions"]:
+        log.info(f"    ⚠️  {sug}")
+
     # 保存详细分析
     analysis_dir = output_dir / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
@@ -840,13 +1042,11 @@ def analyze_evaluation_results(all_eval_results, family_id, output_dir, family_l
     analysis_data = {
         "family_id": family_id,
         "timestamp": datetime.now().isoformat(),
-        "summary": {
-            "total": total,
-            "correct": correct_count,
-            "accuracy": correct_count / total if total else 0,
-            "wrong_role_only": len(wrong_role_type),
-            "wrong_sub_only": len(wrong_sub_role_type),
-            "wrong_both": len(wrong_both)
+        "summary": summary["overview"],
+        "deep_analysis": {
+            "retrieval_quality": summary["retrieval_quality"],
+            "visual_confusion_keywords": summary["visual_confusion_keywords"],
+            "automated_suggestions": summary["suggestions"]
         },
         "correct_samples": correct_predictions[:10],  # 保存前10个正确样本
         "wrong_samples": {
@@ -887,14 +1087,15 @@ def evaluate_on_set(eval_events, user_id, mem_cube_id, desc="Validation", phase_
     
     def _eval_infer(idx_event):
         idx, event = idx_event
-        role, sub, conf, reasoning, retrieved_memories = infer_event(event, user_id, mem_cube_id)
+        role, sub, conf, reasoning, retrieved_memories, prompt = infer_event(event, user_id, mem_cube_id)
         return idx, {
             "video_path": event['video_path'],
             "predicted_role_type": role,
             "predicted_sub_role_type": sub,
             "confidence": conf,
             "reasoning": reasoning,
-            "retrieved_memories": retrieved_memories
+            "retrieved_memories": retrieved_memories,
+            "prompt": prompt
         }
     
     # 并行推理，无worker限制
@@ -931,6 +1132,18 @@ def evaluate_on_set(eval_events, user_id, mem_cube_id, desc="Validation", phase_
     
     sys.stdout.write("\n")
     metrics = MetricsCalculator.calculate(predictions, ground_truths)
+    partitions = _partition_predictions(predictions, ground_truths)
+    analysis_summary = _build_analysis_summary(partitions)
+    
+    if phase_info and phase_info.get('current_phase') == phase_info.get('total_phases'):
+        log.info(f"  🧠 最终阶段错误分析:")
+        log.info(f"    - 平均检索记忆数(错误样本): {analysis_summary['retrieval_quality']['avg_retrieved_for_errors']:.1f}")
+        log.info(f"    - 无检索命中占比: {analysis_summary['retrieval_quality']['zero_retrieval_ratio']*100:.1f}%")
+        if analysis_summary["visual_confusion_keywords"]:
+            keywords_str = ", ".join([f"{item['keyword']}({item['count']})" for item in analysis_summary["visual_confusion_keywords"]])
+            log.info(f"    - 高频视觉混淆特征: {keywords_str}")
+        for sug in analysis_summary["suggestions"]:
+            log.info(f"    ⚠️  {sug}")
     
     log.info(f"  📊 评估结果 ({desc}):")
     log.info(f"    - 身份大类准确率: {metrics['role_acc']*100:.1f}%")
@@ -971,7 +1184,8 @@ def evaluate_on_set(eval_events, user_id, mem_cube_id, desc="Validation", phase_
                         "sub_role_type": pred['predicted_sub_role_type'].strip().lower() == gt['sub_role_type'].strip().lower()
                     },
                     "reasoning": pred.get('reasoning', 'N/A'),
-                    "retrieved_memories": pred.get('retrieved_memories', [])
+                    "retrieved_memories": pred.get('retrieved_memories', []),
+                    "prompt": pred.get('prompt', 'N/A')
                 })
         
         eval_data = {
@@ -981,7 +1195,8 @@ def evaluate_on_set(eval_events, user_id, mem_cube_id, desc="Validation", phase_
             "timestamp": datetime.now().isoformat(),
             "metrics": metrics,
             "total_samples": total,
-            "detailed_results": detailed_results
+            "detailed_results": detailed_results,
+            "analysis_summary": analysis_summary
         }
         
         with open(eval_file, 'w', encoding='utf-8') as f:
@@ -1056,6 +1271,9 @@ def process_family(
     all_eval_results = []  # 保存所有评估结果用于最终分析
     phase_start_time = time.time()
     
+    # 初始化记忆操作统计
+    memory_stats = {"deletion_ops": 0, "deleted_count": 0}
+    
     # 预估每个阶段的时间（基于首个阶段的实际耗时动态调整）
     estimated_phase_time = None
     
@@ -1076,12 +1294,10 @@ def process_family(
         # A. 加入记忆（包含标签信息用于学习，并自动清理重复维度）
         add_events_to_memory(current_chunk, user_id, mem_cube_id, session_id, 
                             phase_info=phase_info, include_labels=True,
-                            clean_duplicates=True, family_logger=family_logger)
+                            clean_duplicates=True, family_logger=family_logger,
+                            memory_stats=memory_stats)
         
-        # B. 保存当前阶段的非事实记忆（每个阶段都保存最新状态）
-        save_non_factual_memories(family_id, mem_cube_id, output_dir, family_logger)
-        
-        # C. 验证
+        # B. 验证
         family_logger.info(f"   🧪 在验证集上评估 (基于前 {end_idx} 条记忆)...")
         metrics, predictions, ground_truths = evaluate_on_set(
             validation_set, user_id, mem_cube_id, f"Phase {chunk_num}", 
@@ -1138,10 +1354,11 @@ def process_family(
     family_logger.info(f"\n📦 补充验证集到记忆库 (为了10月推理)...")
     add_events_to_memory(validation_set, user_id, mem_cube_id, session_id, 
                         phase_info=None, include_labels=True,
-                        clean_duplicates=True, family_logger=family_logger)
+                        clean_duplicates=True, family_logger=family_logger,
+                        memory_stats=memory_stats)
     
-    # 保存最终的非事实记忆
-    save_non_factual_memories(family_id, mem_cube_id, output_dir, family_logger)
+    # 保存最终的全量记忆和统计
+    save_all_memories_and_stats(family_id, mem_cube_id, output_dir, family_logger, memory_stats)
     
     # 5. 最终10月推理（实时写入）
     family_logger.info(f"\n🔮 开始10月数据全量推理 ({len(test_oct)} 条) [{mode_label}]...")
@@ -1171,7 +1388,7 @@ def process_family(
     
     def _infer(idx_event):
         idx, event = idx_event
-        role, sub, conf, reasoning, retrieved_memories = infer_event(event, user_id, mem_cube_id)
+        role, sub, conf, reasoning, retrieved_memories, prompt = infer_event(event, user_id, mem_cube_id)
         return idx, {
             "video_path": event['video_path'],
             "timestamp": event['timestamp'],
@@ -1180,7 +1397,8 @@ def process_family(
             "predicted_sub_role_type": sub,
             "confidence": conf,
             "reasoning": reasoning,
-            "retrieved_memories": retrieved_memories
+            "retrieved_memories": retrieved_memories,
+            "prompt": prompt
         }
     
     with ThreadPoolExecutor() as executor:
