@@ -60,20 +60,14 @@ class OpenAILLM(BaseLLM):
     @timed(log=True, log_prefix="OpenAI LLM")
     def generate(self, messages: MessageList) -> str:
         """Generate a response from OpenAI LLM."""
-        # 构建基础参数
-        params = {
-            "model": self.config.model_name_or_path,
-            "messages": messages,
-            "extra_body": self.config.extra_body,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-        }
-        
-        # GPT-5 模型不支持 top_p 参数，需要排除
-        if not self.config.model_name_or_path.startswith("gpt-5"):
-            params["top_p"] = self.config.top_p
-        
-        response = self.client.chat.completions.create(**params)
+        response = self.client.chat.completions.create(
+            model=self.config.model_name_or_path,
+            messages=messages,
+            extra_body=self.config.extra_body,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+            top_p=self.config.top_p,
+        )
         logger.info(f"Response from OpenAI: {response.model_dump_json()}")
         response_content = response.choices[0].message.content
         if self.config.remove_think_prefix:
@@ -84,21 +78,15 @@ class OpenAILLM(BaseLLM):
     @timed(log=True, log_prefix="OpenAI LLM")
     def generate_stream(self, messages: MessageList, **kwargs) -> Generator[str, None, None]:
         """Stream response from OpenAI LLM with optional reasoning support."""
-        # 构建基础参数
-        params = {
-            "model": self.config.model_name_or_path,
-            "messages": messages,
-            "stream": True,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-            "extra_body": self.config.extra_body,
-        }
-        
-        # GPT-5 模型不支持 top_p 参数，需要排除
-        if not self.config.model_name_or_path.startswith("gpt-5"):
-            params["top_p"] = self.config.top_p
-        
-        response = self.client.chat.completions.create(**params)
+        response = self.client.chat.completions.create(
+            model=self.config.model_name_or_path,
+            messages=messages,
+            stream=True,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+            top_p=self.config.top_p,
+            extra_body=self.config.extra_body,
+        )
 
         reasoning_started = False
 
@@ -170,19 +158,13 @@ class AzureLLM(BaseLLM):
 
     def generate(self, messages: MessageList) -> str:
         """Generate a response from Azure OpenAI LLM."""
-        # 构建基础参数
-        params = {
-            "model": self.config.model_name_or_path,
-            "messages": messages,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-        }
-        
-        # GPT-5 模型不支持 top_p 参数，需要排除
-        if not self.config.model_name_or_path.startswith("gpt-5"):
-            params["top_p"] = self.config.top_p
-        
-        response = self.client.chat.completions.create(**params)
+        response = self.client.chat.completions.create(
+            model=self.config.model_name_or_path,
+            messages=messages,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+            top_p=self.config.top_p,
+        )
         logger.info(f"Response from Azure OpenAI: {response.model_dump_json()}")
         response_content = response.choices[0].message.content
         if self.config.remove_think_prefix:

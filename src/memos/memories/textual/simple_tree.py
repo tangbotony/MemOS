@@ -280,7 +280,15 @@ class SimpleTreeTextMemory(TreeTextMemory):
         return all_items
 
     def delete(self, memory_ids: list[str]) -> None:
-        raise NotImplementedError
+        """Delete memories by their IDs."""
+        for memory_id in memory_ids:
+            try:
+                self.graph_store.delete_node(memory_id)
+            except Exception as e:
+                logger.error(f"Failed to delete memory {memory_id}: {e}")
+                # Optionally re-raise or continue depending on requirements.
+                # For batch delete, continuing might be better, or collecting errors.
+                pass
 
     def delete_all(self) -> None:
         """Delete all memories and their relationships from the graph store."""

@@ -960,12 +960,16 @@ def add_memories(add_req: APIADDRequest):
                         
                         if is_duplicate:
                             logger.info(f"   判定: 重复 - {dup_reason}")
-                            duplicate_count += 1
-                            duplicate_memories.append({
-                                'content': memory_content,
-                                'reason': dup_reason
-                            })
-                            continue  # 跳过这条重复记忆
+                            # 🔄 删除旧的重复记忆，然后添加新的（新的可能综合了更多信息）
+                            old_mem_ids = [mem.id for mem in non_factual_memories if hasattr(mem, 'id') and mem.id]
+                            if old_mem_ids:
+                                try:
+                                    logger.info(f"   🗑️  删除 {len(old_mem_ids)} 条旧记忆: {old_mem_ids[:5]}...")
+                                    naive_mem_cube.text_mem.delete(old_mem_ids)
+                                    logger.info(f"   ➕ 添加新的更新版本记忆")
+                                except Exception as del_e:
+                                    logger.warning(f"   ⚠️  删除旧记忆失败: {del_e}，继续添加新记忆")
+                            # 继续添加新记忆（不再 continue 跳过）
                         else:
                             logger.info(f"   判定: 不重复 - {dup_reason}")
                     else:
@@ -1120,6 +1124,7 @@ def add_memories(add_req: APIADDRequest):
         return result_memories
 
     def _process_pref_mem() -> list[dict[str, str]]:
+        # 检查是否启用preference memory（通过环境变量）
         if os.getenv("ENABLE_PREFERENCE_MEMORY", "false").lower() != "true":
             return []
         pref_memories_local = naive_mem_cube.pref_mem.get_memory(
@@ -1144,11 +1149,19 @@ def add_memories(add_req: APIADDRequest):
             for memory_id, memory in zip(pref_ids_local, pref_memories_local, strict=False)
         ]
 
-    with ContextThreadPoolExecutor(max_workers=2) as executor:
-        text_future = executor.submit(_process_text_mem)
-        pref_future = executor.submit(_process_pref_mem)
-        text_response_data = text_future.result()
-        pref_response_data = pref_future.result()
+    # 根据环境变量决定是否并行处理preference memory
+    enable_pref = os.getenv("ENABLE_PREFERENCE_MEMORY", "false").lower() == "true"
+    
+    if enable_pref:
+        with ContextThreadPoolExecutor(max_workers=2) as executor:
+            text_future = executor.submit(_process_text_mem)
+            pref_future = executor.submit(_process_pref_mem)
+            text_response_data = text_future.result()
+            pref_response_data = pref_future.result()
+    else:
+        # 只处理text memory
+        text_response_data = _process_text_mem()
+        pref_response_data = []
 
     return MemoryResponse(
         message="Memory added successfully",

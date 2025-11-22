@@ -798,7 +798,8 @@ class PolarDBGraphDB(BaseGraphDB):
             where_conditions.append(
                 "ag_catalog.agtype_access_operator(properties, '\"id\"'::agtype) = %s::agtype"
             )
-            params.append(f"{id_val}")
+            # FIX: Use json.dumps to ensure correct JSON string representation
+            params.append(json.dumps(str(id_val)))
 
         where_clause = " OR ".join(where_conditions)
 
@@ -810,7 +811,8 @@ class PolarDBGraphDB(BaseGraphDB):
 
         user_name = user_name if user_name else self.config.user_name
         query += " AND ag_catalog.agtype_access_operator(properties, '\"user_name\"'::agtype) = %s::agtype"
-        params.append(f'"{user_name}"')
+        # FIX: Use json.dumps to ensure correct JSON string representation
+        params.append(json.dumps(str(user_name)))
 
         # print(f"[get_nodes] query: {query}, params: {params}")
         with self.connection.cursor() as cursor:

@@ -470,6 +470,8 @@ class SimpleStructMemReader(BaseMemReader, ABC):
 
         if type == "chat":
             for items in scene_data:
+                if items is None:
+                    continue
                 result = []
                 for item in items:
                     # Convert dictionary to string
