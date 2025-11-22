@@ -177,6 +177,10 @@ venv.bak/
 *.pkl
 *.html
 
+# Allow committing Anker evaluation test data package (needs to override *.json rule)
+!evaluation/data/anker/Test_data_22_pu_3_family_mothes_seperated/
+!evaluation/data/anker/Test_data_22_pu_3_family_mothes_seperated/**
+
 # but do not ignore docs/openapi.json
 !docs/openapi.json
 
