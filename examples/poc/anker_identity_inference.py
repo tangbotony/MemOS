@@ -4,11 +4,11 @@ Anker 家庭安防 - 渐进式身份推理与评估系统
 核心流程:
 1. 数据排序: 从数据量少的家庭开始处理
 2. 渐进式学习:
-   - 将9月数据划分为: 90% 训练流 + 10% 验证集(时间轴最后10%)
-   - 逐步将训练流加入记忆系统(每10%)
+   - 将9月数据划分为: 训练流 + 验证集(随机采样50条，无交集)
+   - 逐步将训练流加入记忆系统(分多个阶段)
    - 每次加入后,在验证集上评估准确率指标
 3. 最终推理:
-   - 补充完整9月记忆
+   - 补充完整9月记忆(包括验证集)
    - 对10月数据进行全量推理
 
 评估指标:
@@ -23,6 +23,7 @@ import sys
 import time
 import re
 import math
+import random
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -742,7 +743,7 @@ def infer_event(event, user_id, mem_cube_id):
     if learned_prototypes:
         prototype_block = "\n[Learned Identity Prototypes]\n" + "\n".join([f"- {p}" for p in learned_prototypes])
 
-    query = f"""Based on the learned family history and identity patterns, infer the identity for this security event.
+    query = f"""Analyze this home security event and classify the identity based on learned family patterns.
 {prototype_block}
 {few_shot_block}
 
@@ -750,32 +751,111 @@ Current Event:
 - Time: {fmt_time} ({period})
 - Description: {desc}
 
-Analysis Instructions:
-1. FIRST, check [Learned Identity Prototypes] for direct matches.
-2. SECOND, compare with [Historical Similar Events]. If the current event visually resembles a historical example labeled as "Family Member", adopt that label.
-3. Compare current event with learned identity categories:
-   - Role Type: General Identity / Passerby / Staff / Suspicious Person / Unspecified / Non-Human
-   - Sub-role Type: Family Member / Visitor / Delivery Person / Other General Identity / Critical Non-Human Event / etc.
+## Classification System
+**role_type**: General Identity | Passerby | Staff | Suspicious Person | Unspecified | Non-Human
+**sub_role_type**: 
+- General Identity → Family Member | Visitor | Other General Identity
+- Passerby → Passerby
+- Staff → Delivery Person | Police | Service Worker | Other Staff
+- Suspicious Person → Unauthorized Entry | Property Damage | Armed Person | Fighting | Other Suspicious Person
+- Non-Human → Vehicle Activity | Pet/Animal Activity | Environmental Change Only
 
-4. Pay special attention to:
-   - VISUAL MATCHING: Confidence should be HIGH if visuals match a Prototype or a Historical Example.
-   - Time of day patterns (e.g., family members at certain times)
-   - Contextual clues (e.g., delivery uniforms for staff)
-   - Behavioral consistency with learned patterns
+⚠️ CRITICAL: "Family Member" and "Visitor" are sub_role_type ONLY, never use them as role_type.
 
-Output format (strict):
-role_type: [TYPE]
-sub_role_type: [SUBTYPE]
+## Key Guidance
+
+**Location is critical:**
+- Person exiting FROM or inside courtyard/residence → likely Family Member (not Passerby)
+- Person walking PAST outside with no interaction → likely Passerby
+- Interacting with residence (door, car, mailbox) → Family Member or Visitor
+
+**Identity signals:**
+- Visual match with learned family patterns → Family Member
+- Uniform or delivery behavior → Staff
+- Forced entry, weapons, breaking things → Suspicious Person
+
+Output format:
+role_type: [one of the 6 types above]
+sub_role_type: [corresponding sub-type]
 confidence: [High/Medium/Low]
-reasoning: [Brief explanation referencing specific prototypes or examples if matched]
+reasoning: [Your analysis: location, interaction, visual match, and conclusion]
 """
     try:
         response = llm.generate([{"role": "user", "content": query}])
         role, sub, conf, reasoning = parse_result(response)
+        # 后处理：修正常见的分类错误（传入描述用于基于位置的修正）
+        role, sub = fix_classification_errors(role, sub, desc)
         return role, sub, conf, reasoning, retrieved_memories, query
     except Exception as e:
         logger.error(f"Inference failed: {e}")
         return "Unspecified", "Unspecified", "Low", "", retrieved_memories, query
+
+def fix_classification_errors(role_type, sub_role_type, description=""):
+    """修正常见的分类层级错误
+    
+    常见错误：
+    1. Family Member / Visitor 被错误地用作 role_type
+    2. 需要确保 Family Member/Visitor 的 role_type 是 General Identity
+    3. 从院子/住宅里出来的人被误判为Passerby
+    """
+    desc_lower = description.lower()
+    
+    # 🚨 关键修正：基于位置语义的强制修正
+    # 如果描述包含"从院子里出来"等关键词，但被分类为Passerby，强制改为Family Member
+    exit_phrases = [
+        "out of the courtyard",
+        "from the courtyard", 
+        "exits residence",
+        "walks out of",
+        "exiting from",
+        "leaves the residence",
+        "from the residence"
+    ]
+    
+    inside_phrases = [
+        "in the courtyard",
+        "in the property",
+        "in a residential courtyard",
+        "inside the courtyard"
+    ]
+    
+    # 检查是否从内部出来或在内部活动
+    is_exiting = any(phrase in desc_lower for phrase in exit_phrases)
+    is_inside = any(phrase in desc_lower for phrase in inside_phrases)
+    
+    if (is_exiting or is_inside) and role_type == "Passerby":
+        logger.warning(f"⚠️ 位置修正: '{desc_lower[:50]}...' 包含住宅内部活动，Passerby → General Identity / Family Member")
+        return "General Identity", "Family Member"
+    
+    # 修正Family Member错误
+    if role_type.lower() in ["family member", "family"]:
+        logger.warning(f"⚠️ 层级修正: role_type='Family Member' → 'General Identity' / 'Family Member'")
+        return "General Identity", "Family Member"
+    
+    # 修正Visitor错误  
+    if role_type.lower() == "visitor":
+        logger.warning(f"⚠️ 层级修正: role_type='Visitor' → 'General Identity' / 'Visitor'")
+        return "General Identity", "Visitor"
+    
+    # 修正其他可能的sub_role被用作role_type的情况
+    sub_role_values = {
+        "delivery person": ("Staff", "Delivery Person"),
+        "police": ("Staff", "Police"),
+        "service worker": ("Staff", "Service Worker"),
+        "government worker": ("Staff", "Government Worker"),
+        "unauthorized entry": ("Suspicious Person", "Unauthorized Entry"),
+        "property damage": ("Suspicious Person", "Property Damage"),
+        "armed person": ("Suspicious Person", "Armed Person"),
+        "fighting": ("Suspicious Person", "Fighting"),
+    }
+    
+    role_lower = role_type.lower()
+    if role_lower in sub_role_values:
+        correct_role, correct_sub = sub_role_values[role_lower]
+        logger.warning(f"⚠️ 修正错误: role_type='{role_type}' → '{correct_role}' / '{correct_sub}'")
+        return correct_role, correct_sub
+    
+    return role_type, sub_role_type
 
 def parse_result(text):
     role = "Unspecified"
@@ -1135,6 +1215,28 @@ def evaluate_on_set(eval_events, user_id, mem_cube_id, desc="Validation", phase_
     partitions = _partition_predictions(predictions, ground_truths)
     analysis_summary = _build_analysis_summary(partitions)
     
+    # 输出所有错误案例的推理原因（完整描述，不截断）
+    # 收集所有错误样本（按优先级）
+    all_wrong = partitions["wrong_both"] + partitions["wrong_role_type"] + partitions["wrong_sub_role_type"]
+    
+    if all_wrong:
+        log.info(f"\n  🔍 错误样本推理分析 (共 {len(all_wrong)} 个错误):")
+        # 显示所有错误样本（无限制）
+        for i, sample in enumerate(all_wrong, 1):
+            log.info(f"    【错误样本 {i}】")
+            log.info(f"      描述: {sample['description']}")  # 完整描述，不截断
+            log.info(f"      真实标签: {sample['ground_truth']['role_type']} / {sample['ground_truth']['sub_role_type']}")
+            log.info(f"      预测标签: {sample['predicted']['role_type']} / {sample['predicted']['sub_role_type']}")
+            log.info(f"      置信度: {sample['predicted']['confidence']}")
+            log.info(f"      使用记忆数: {sample['retrieved_memories_count']}")
+            # 提取reasoning的核心部分（去掉重复的标签信息）
+            reasoning_text = sample.get('reasoning', '')
+            if 'reasoning:' in reasoning_text:
+                reasoning_core = reasoning_text.split('reasoning:')[-1].strip()
+                # 完整显示推理依据，不截断
+                log.info(f"      推理依据: {reasoning_core}")
+            log.info("")
+    
     if phase_info and phase_info.get('current_phase') == phase_info.get('total_phases'):
         log.info(f"  🧠 最终阶段错误分析:")
         log.info(f"    - 平均检索记忆数(错误样本): {analysis_summary['retrieval_quality']['avg_retrieved_for_errors']:.1f}")
@@ -1241,14 +1343,21 @@ def process_family(
     if max_test_samples is not None:
         test_oct = test_oct[:max_test_samples]
     
-    # 切分 Validation Set (固定取最后 10%)
-    val_size = int(len(train_all) * 0.1)
-    # 确保至少有一些验证数据，但对于小数据集（<50条）使用更小的最小值
-    min_val_size = 3 if len(train_all) < 50 else 10
-    val_size = max(val_size, min_val_size) 
+    # 随机切分 Validation Set (固定50条，从9月数据中随机采样)
+    val_size = 50  # 固定验证集大小为50条
+    # 确保数据量足够
+    if len(train_all) < val_size + 10:  # 至少需要50条验证+10条训练
+        # 如果数据太少，动态调整验证集大小
+        val_size = max(3, int(len(train_all) * 0.2))  # 至少3条，最多20%
     
-    train_stream = train_all[:-val_size]
-    validation_set = train_all[-val_size:]
+    # 随机采样验证集索引
+    all_indices = list(range(len(train_all)))
+    random.seed(42)  # 设置随机种子以保证可复现
+    val_indices = set(random.sample(all_indices, val_size))
+    
+    # 分离训练集和验证集（确保无交集）
+    validation_set = [train_all[i] for i in range(len(train_all)) if i in val_indices]
+    train_stream = [train_all[i] for i in range(len(train_all)) if i not in val_indices]
     
     # 3. 渐进式训练与验证
     # split_ratio 控制训练流每次加入的比例（默认 20%）
@@ -1260,8 +1369,8 @@ def process_family(
     mode_label = "PRE-FLIGHT" if preflight else "FULL RUN"
     family_logger.info(f"📊 数据概览 ({mode_label}):")
     family_logger.info(f"  - 9月总数据: {len(train_all)}")
-    family_logger.info(f"  - 训练流 (Training Stream): {len(train_stream)}")
-    family_logger.info(f"  - 验证集 (Validation Set): {len(validation_set)} (最后10%)")
+    family_logger.info(f"  - 训练流 (Training Stream): {len(train_stream)} (随机采样)")
+    family_logger.info(f"  - 验证集 (Validation Set): {len(validation_set)} (随机采样，无交集)")
     family_logger.info(f"  - 10月测试集: {len(test_oct)}")
     family_logger.info(f"  - 训练阶段数: {total_phases} (chunk size={chunk_size})")
     
@@ -1459,7 +1568,7 @@ def main():
         "--mode",
         choices=["quick", "single", "all", "fast_test"],
         default="single",
-        help="运行模式：quick=最小数据家庭，single=单个家庭，all=全部家庭，fast_test=快速全流程验证(每阶段10条)",
+        help="运行模式：quick=最小数据家庭，single=单个家庭，all=全部家庭，fast_test=快速全流程验证(训练200+验证50+推理10)",
     )
     parser.add_argument(
         "--family",
@@ -1511,10 +1620,10 @@ def main():
         logger.info("🧪 预检完成，开始正式流程...\n")
     
     if args.mode == "fast_test":
-        # 快速全流程验证：所有家庭，每个阶段不超过10条
+        # 快速全流程验证：所有家庭，训练200条+验证50条，推理10条
         families = FAMILY_ORDER if not args.family else [args.family]
         total = len(families)
-        logger.info(f"⚡ 快速验证模式：并行测试所有家庭 ({total}个) - 每阶段≤10条")
+        logger.info(f"⚡ 快速验证模式：并行测试所有家庭 ({total}个) - 训练200条+验证50条+推理10条")
         
         # 为每个家庭创建独立的日志文件
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1560,8 +1669,8 @@ def main():
                     family_id,
                     output_dir,
                     split_ratio=0.25,  # 每次加入25%，4个批次
-                    max_train_events=27,  # 快速测试：27条训练数据（训练流24条+验证集3条）→ 4批次，每批6条
-                    max_test_samples=5,   # 快速测试：5条10月数据
+                    max_train_events=250,  # 快速测试：250条训练数据（训练流200条+验证集50条）→ 4批次，每批50条
+                    max_test_samples=10,   # 快速测试：10条10月数据
                     preflight=False,
                     family_logger=family_logger,
                 )
