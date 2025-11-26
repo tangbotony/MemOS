@@ -421,7 +421,7 @@ user: [2025年6月26日下午4:21]：好主意。我明天上午9:30的会上提
 # Security/Event Pattern Extraction Prompt for Smart Home Security Monitoring
 SECURITY_EVENT_PATTERN_PROMPT = r"""You are extracting patterns from smart home security events. Output ONLY valid JSON.
 
-【JSON FORMAT】
+[JSON FORMAT]
 {
   "memory list": [
     {"key": "current_event", "memory_type": "UserMemory", "value": "[Factual Memory] ..."},
@@ -429,15 +429,15 @@ SECURITY_EVENT_PATTERN_PROMPT = r"""You are extracting patterns from smart home 
   ]
 }
 
-【OUTPUT RULES】
+[OUTPUT RULES]
 1. ALWAYS output 1 [Factual Memory] for current event (1 concise sentence)
 2. **HIGHEST PRIORITY: Extract family_commute time pattern if ANY time-related activities exist**
 3. Output 0-3 additional [Pattern Memory] based on evidence strength
 4. Use English labels: [Factual Memory], [Pattern Memory], [Inference Memory]
 5. **Keep it CONCISE**: Use simple, direct language. Avoid unnecessary words or elaborate descriptions
 
-【PATTERN KEYS - 只关注以下 6 个核心维度】
-⚠️ **重要**：只提取这 6 个维度，其他维度（如 door_usage, door_state, delivery_pattern 等）不要提取
+[PATTERN KEYS - Focus on these 6 core dimensions only]
+⚠️ **Important**: Only extract these 6 dimensions. DO NOT extract other dimensions (e.g., door_usage, door_state, delivery_pattern, etc.)
 
 1. **family_commute** (HIGHEST PRIORITY - MUST EXTRACT): Family member commute time patterns
    - **Must include time ranges**: "HH:MM-HH:MM" format
@@ -472,17 +472,17 @@ SECURITY_EVENT_PATTERN_PROMPT = r"""You are extracting patterns from smart home 
      d) Other features: age, who they appear with, etc.
    - Example (concise): "Man (glasses and hat, black/white/grey clothing), woman (glasses, white/black/pink clothing, often with child), child (always with adult)"
 
-5. **recurring_activities**: 重复性活动
-   - 门槛：≥3 次事件
-   - **只关注**：携带物品进出
-   - 示例（简洁）："Family members frequently carry items between residence and vehicles"
+5. **recurring_activities**: Recurring activities
+   - Threshold: ≥3 events
+   - **Focus only on**: Carrying items in/out
+   - Example (concise): "Family members frequently carry items between residence and vehicles"
 
 6. **interaction_patterns**: Interaction patterns between people and vehicles/pets
    - Threshold: ≥3 events
    - **Must include**: vehicle interaction AND pet interaction (if both are observed)
    - Example (concise): "Vehicles used for family travel; pets often appear near entrance when family enters/exits"
 
-【TIME EXTRACTION RULES】
+[TIME EXTRACTION RULES]
 ⚠️ **Only family_commute needs time**, other dimensions do NOT need time
 
 **For family_commute - Complete extraction process:**
@@ -507,7 +507,7 @@ SECURITY_EVENT_PATTERN_PROMPT = r"""You are extracting patterns from smart home 
 - Format: "Family members leave between HH:MM-HH:MM, return between HH:MM-HH:MM"
 - Example: if leaves at 07:00, 08:30 and returns at 15:00, 19:00 → "Family members leave between 06:00-10:00, return between 14:00-21:00"
 
-【EXTRACTION PRIORITIES】
+[EXTRACTION PRIORITIES]
 1. **family_commute (MANDATORY if time data exists)** - MUST include BOTH "leave" and "return"
 2. **pet** - List all species/colors
 3. **vehicle** - Only list frequently appearing colors (≥5 times)
@@ -515,7 +515,7 @@ SECURITY_EVENT_PATTERN_PROMPT = r"""You are extracting patterns from smart home 
 5. **recurring_activities** - Common behaviors
 6. **interaction_patterns** - People-vehicle, people-pet interactions (both required)
 
-【EXAMPLE】
+[EXAMPLE]
 Input:
 - current_event: [08:15 | Family | Normal] A woman exits and walks to a black car
 - historical_events: 
@@ -543,7 +543,7 @@ Output:
   ]
 }
 
-【MANDATORY CHECKLIST - Must Complete Before Output】
+[MANDATORY CHECKLIST - Must Complete Before Output]
 ⚠️ **You MUST verify each item below before generating JSON, or your output will be rejected**:
 
 □ family_commute verification:
@@ -565,7 +565,7 @@ Output:
 
 ✅ Only output JSON after completing ALL checks above!
 
-【INPUT】
+[INPUT]
 - current_event: ${current_event}
 - historical_events: ${historical_events}
 
