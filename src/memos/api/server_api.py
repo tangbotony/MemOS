@@ -9,6 +9,7 @@ from starlette.staticfiles import StaticFiles
 from memos.api.exceptions import APIExceptionHandler
 from memos.api.middleware.request_context import RequestContextMiddleware
 from memos.api.routers.server_router import router as server_router
+from memos.plugins import load_plugins
 
 
 load_dotenv()
@@ -28,6 +29,9 @@ app.mount("/download", StaticFiles(directory=os.getenv("FILE_LOCAL_PATH")), name
 app.add_middleware(RequestContextMiddleware, source="server_api")
 # Include routers
 app.include_router(server_router)
+
+# Load optional plugins (e.g., enterprise extensions) via entry points.
+load_plugins(app=app)
 
 # Request validation failed
 app.exception_handler(RequestValidationError)(APIExceptionHandler.validation_error_handler)

@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from memos.api.exceptions import APIExceptionHandler
 from memos.api.middleware.request_context import RequestContextMiddleware
 from memos.api.routers.product_router import router as product_router
+from memos.plugins import load_plugins
 
 
 # Configure logging
@@ -20,6 +21,9 @@ app = FastAPI(
 app.add_middleware(RequestContextMiddleware, source="product_api")
 # Include routers
 app.include_router(product_router)
+
+# Load optional plugins (e.g., enterprise extensions) via entry points.
+load_plugins(app=app)
 
 # Exception handlers
 app.exception_handler(ValueError)(APIExceptionHandler.value_error_handler)

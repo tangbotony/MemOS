@@ -31,6 +31,7 @@ from memos.api.routers.admin_router import router as admin_router
 
 # Import base routers from MemOS
 from memos.api.routers.server_router import router as server_router
+from memos.plugins import load_plugins
 
 
 # Try to import exception handlers (may vary between MemOS versions)
@@ -96,6 +97,9 @@ if RATE_LIMIT_ENABLED:
 # Include routers
 app.include_router(server_router)
 app.include_router(admin_router)
+
+# Load optional plugins (e.g., enterprise extensions) via entry points.
+load_plugins(app=app)
 
 # Exception handlers
 if HAS_EXCEPTION_HANDLER:

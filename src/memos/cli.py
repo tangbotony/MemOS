@@ -10,6 +10,8 @@ import zipfile
 
 from io import BytesIO
 
+from memos.plugins import load_cli_plugins
+
 
 def export_openapi(output: str) -> bool:
     """Export OpenAPI schema to JSON file."""
@@ -95,8 +97,17 @@ def main():
         help="Output path for OpenAPI schema (default: openapi.json)",
     )
 
+    # Load optional CLI plugins (e.g., enterprise commands) via entry points.
+    load_cli_plugins(subparsers=subparsers)
+
     # Parse arguments
     args = parser.parse_args()
+
+    # Plugin commands can register a callable via argparse defaults.
+    run = getattr(args, "_run", None)
+    if callable(run):
+        run(args)
+        return
 
     # Handle commands
     if args.command == "download_examples":
