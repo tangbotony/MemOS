@@ -1,12 +1,25 @@
 import * as fs from "fs";
 import * as path from "path";
 import type { SummarizerConfig, SummaryProvider, Logger } from "../../types";
-import { summarizeOpenAI, summarizeTaskOpenAI, judgeNewTopicOpenAI, filterRelevantOpenAI, judgeDedupOpenAI } from "./openai";
+import { summarizeOpenAI, summarizeTaskOpenAI, generateTaskTitleOpenAI, judgeNewTopicOpenAI, filterRelevantOpenAI, judgeDedupOpenAI } from "./openai";
 import type { FilterResult, DedupResult } from "./openai";
 export type { FilterResult, DedupResult } from "./openai";
 import { summarizeAnthropic, summarizeTaskAnthropic, generateTaskTitleAnthropic, judgeNewTopicAnthropic, filterRelevantAnthropic, judgeDedupAnthropic } from "./anthropic";
 import { summarizeGemini, summarizeTaskGemini, generateTaskTitleGemini, judgeNewTopicGemini, filterRelevantGemini, judgeDedupGemini } from "./gemini";
 import { summarizeBedrock, summarizeTaskBedrock, generateTaskTitleBedrock, judgeNewTopicBedrock, filterRelevantBedrock, judgeDedupBedrock } from "./bedrock";
+
+/**
+ * Resolve a SecretInput (string | SecretRef) to a plain string.
+ * Supports env-sourced SecretRef from OpenClaw's credential system.
+ */
+function resolveApiKey(
+  input: string | { source: string; provider?: string; id: string } | undefined,
+): string | undefined {
+  if (!input) return undefined;
+  if (typeof input === "string") return input;
+  if (input.source === "env") return process.env[input.id];
+  return undefined;
+}
 
 /**
  * Detect provider type from provider key name or base URL.
@@ -49,8 +62,8 @@ function normalizeEndpointForProvider(
 function loadOpenClawFallbackConfig(log: Logger): SummarizerConfig | undefined {
   try {
     const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-    const ocHome = process.env.OPENCLAW_STATE_DIR || path.join(home, ".openclaw");
-    const cfgPath = path.join(ocHome, "openclaw.json");
+    const cfgPath = process.env.OPENCLAW_CONFIG_PATH
+      || path.join(process.env.OPENCLAW_STATE_DIR || path.join(home, ".openclaw"), "openclaw.json");
     if (!fs.existsSync(cfgPath)) return undefined;
 
     const raw = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
@@ -68,7 +81,7 @@ function loadOpenClawFallbackConfig(log: Logger): SummarizerConfig | undefined {
     if (!providerCfg) return undefined;
 
     const baseUrl: string | undefined = providerCfg.baseUrl;
-    const apiKey: string | undefined = providerCfg.apiKey;
+    const apiKey = resolveApiKey(providerCfg.apiKey);
     if (!baseUrl || !apiKey) return undefined;
 
     const provider = detectProvider(providerKey, baseUrl);
@@ -154,6 +167,7 @@ export class Summarizer {
   constructor(
     private cfg: SummarizerConfig | undefined,
     private log: Logger,
+    private openclawAPI?: OpenClawAPI,
     strongCfg?: SummarizerConfig,
   ) {
     this.strongCfg = strongCfg;
@@ -163,11 +177,20 @@ export class Summarizer {
   /**
    * Ordered config chain: strongCfg → cfg → fallbackCfg (OpenClaw native model).
    * Returns configs that are defined, in priority order.
+   * Openclaw configs without hostCompletion capability or without openclawAPI are excluded.
    */
   private getConfigChain(): SummarizerConfig[] {
     const chain: SummarizerConfig[] = [];
     if (this.strongCfg) chain.push(this.strongCfg);
-    if (this.cfg) chain.push(this.cfg);
+    if (this.cfg) {
+      if (this.cfg.provider === "openclaw") {
+        if (this.cfg.capabilities?.hostCompletion === true && this.openclawAPI) {
+          chain.push(this.cfg);
+        }
+      } else {
+        chain.push(this.cfg);
+      }
+    }
     if (this.fallbackCfg) chain.push(this.fallbackCfg);
     return chain;
   }
@@ -251,7 +274,9 @@ export class Summarizer {
       return taskFallback(text);
     }
 
-    const result = await this.tryChain("summarizeTask", (cfg) => callSummarizeTask(cfg, text, this.log));
+    const result = await this.tryChain("summarizeTask", (cfg) =>
+      cfg.provider === "openclaw" ? this.summarizeTaskOpenClaw(text) : callSummarizeTask(cfg, text, this.log),
+    );
     return result ?? taskFallback(text);
   }
 
@@ -290,7 +315,11 @@ export class Summarizer {
     if (!this.cfg && !this.fallbackCfg) return null;
     if (candidates.length === 0) return { relevant: [], sufficient: true };
 
-    const result = await this.tryChain("filterRelevant", (cfg) => callFilterRelevant(cfg, query, candidates, this.log));
+    const result = await this.tryChain("filterRelevant", (cfg) =>
+      cfg.provider === "openclaw"
+        ? this.filterRelevantOpenClaw(query, candidates)
+        : callFilterRelevant(cfg, query, candidates, this.log),
+    );
     return result ?? null;
   }
 
@@ -301,12 +330,164 @@ export class Summarizer {
     if (!this.cfg && !this.fallbackCfg) return null;
     if (candidates.length === 0) return null;
 
-    const result = await this.tryChain("judgeDedup", (cfg) => callJudgeDedup(cfg, newSummary, candidates, this.log));
+    const result = await this.tryChain("judgeDedup", (cfg) =>
+      cfg.provider === "openclaw"
+        ? this.judgeDedupOpenClaw(newSummary, candidates)
+        : callJudgeDedup(cfg, newSummary, candidates, this.log),
+    );
     return result ?? { action: "NEW", reason: "all_models_failed" };
   }
 
   getStrongConfig(): SummarizerConfig | undefined {
     return this.strongCfg;
+  }
+
+  // ─── OpenClaw Prompts ───
+
+  static readonly OPENCLAW_TOPIC_JUDGE_PROMPT = `You are a conversation topic change detector.
+Given a CURRENT CONVERSATION SUMMARY and a NEW USER MESSAGE, decide: has the user started a COMPLETELY NEW topic that is unrelated to the current conversation?
+Reply with a single word: "NEW" if topic changed, "SAME" if it continues.`;
+
+  static readonly OPENCLAW_FILTER_RELEVANT_PROMPT = `You are a memory relevance judge.
+Given a QUERY and CANDIDATE memories, decide: does each candidate help answer the query?
+RULES:
+1. Include candidates whose content provides useful facts/context for the query.
+2. Exclude candidates that merely share a topic but contain no useful information.
+3. DEDUPLICATION: When multiple candidates convey the same or very similar information, keep ONLY the most complete one and exclude the rest.
+4. If none help, return {"relevant":[],"sufficient":false}.
+OUTPUT — JSON only: {"relevant":[1,3],"sufficient":true}`;
+
+  static readonly OPENCLAW_DEDUP_JUDGE_PROMPT = `You are a memory deduplication system.
+Given a NEW memory summary and EXISTING candidates, decide if the new memory duplicates any existing one.
+Reply with JSON: {"action":"MERGE","mergeTarget":2,"reason":"..."} or {"action":"NEW","reason":"..."}`;
+
+  static readonly OPENCLAW_TASK_SUMMARY_PROMPT = `Summarize the following task conversation into a structured report. Preserve key decisions, code, commands, and outcomes. Use the same language as the input.`;
+
+  // ─── OpenClaw API Implementation ───
+
+  private requireOpenClawAPI(): void {
+    if (!this.openclawAPI) {
+      throw new Error(
+        "OpenClaw API not available. Ensure sharing.capabilities.hostCompletion is enabled in config."
+      );
+    }
+  }
+
+  private async summarizeOpenClaw(text: string): Promise<string> {
+    this.requireOpenClawAPI();
+    const prompt = [
+      `Summarize the text in ONE concise sentence (max 120 characters). IMPORTANT: Use the SAME language as the input text — if the input is Chinese, write Chinese; if English, write English. Preserve exact names, commands, error codes. No bullet points, no preamble — output only the sentence.`,
+      ``,
+      text.slice(0, 2000),
+    ].join("\n");
+
+    const response = await this.openclawAPI!.complete({
+      prompt,
+      maxTokens: 100,
+      temperature: 0,
+      model: this.cfg?.model,
+    });
+
+    return response.text.trim().slice(0, 200);
+  }
+
+  private async summarizeTaskOpenClaw(text: string): Promise<string> {
+    this.requireOpenClawAPI();
+    const prompt = [
+      Summarizer.OPENCLAW_TASK_SUMMARY_PROMPT,
+      ``,
+      text,
+    ].join("\n");
+
+    const response = await this.openclawAPI!.complete({
+      prompt,
+      maxTokens: 4096,
+      temperature: 0.1,
+      model: this.cfg?.model,
+    });
+
+    return response.text.trim();
+  }
+
+  private async judgeNewTopicOpenClaw(currentContext: string, newMessage: string): Promise<boolean> {
+    this.requireOpenClawAPI();
+    const prompt = [
+      Summarizer.OPENCLAW_TOPIC_JUDGE_PROMPT,
+      ``,
+      `CURRENT CONVERSATION SUMMARY:`,
+      currentContext,
+      ``,
+      `NEW USER MESSAGE:`,
+      newMessage,
+    ].join("\n");
+
+    const response = await this.openclawAPI!.complete({
+      prompt,
+      maxTokens: 10,
+      temperature: 0,
+      model: this.cfg?.model,
+    });
+
+    const answer = response.text.trim().toUpperCase();
+    this.log.debug(`Topic judge result: "${answer}"`);
+    return answer.startsWith("NEW");
+  }
+
+  private async filterRelevantOpenClaw(
+    query: string,
+    candidates: Array<{ index: number; role: string; content: string; time?: string }>,
+  ): Promise<FilterResult> {
+    this.requireOpenClawAPI();
+    const candidateText = candidates
+      .map((c) => `${c.index}. [${c.role}] ${c.content}`)
+      .join("\n");
+
+    const prompt = [
+      Summarizer.OPENCLAW_FILTER_RELEVANT_PROMPT,
+      ``,
+      `QUERY: ${query}`,
+      ``,
+      `CANDIDATES:`,
+      candidateText,
+    ].join("\n");
+
+    const response = await this.openclawAPI!.complete({
+      prompt,
+      maxTokens: 200,
+      temperature: 0,
+      model: this.cfg?.model,
+    });
+
+    return parseFilterResult(response.text.trim(), this.log);
+  }
+
+  private async judgeDedupOpenClaw(
+    newSummary: string,
+    candidates: Array<{ index: number; summary: string; chunkId: string }>,
+  ): Promise<DedupResult> {
+    this.requireOpenClawAPI();
+    const candidateText = candidates
+      .map((c) => `${c.index}. ${c.summary}`)
+      .join("\n");
+
+    const prompt = [
+      Summarizer.OPENCLAW_DEDUP_JUDGE_PROMPT,
+      ``,
+      `NEW MEMORY:`,
+      newSummary,
+      ``,
+      `EXISTING MEMORIES:`,
+      candidateText,
+    ].join("\n");
+
+    const response = await this.openclawAPI!.complete({
+      prompt,
+      maxTokens: 300,
+      temperature: 0,
+      model: this.cfg?.model,
+    });
+
+    return parseDedupResult(response.text.trim(), this.log);
   }
 }
 
@@ -319,6 +500,8 @@ function callSummarize(cfg: SummarizerConfig, text: string, log: Logger): Promis
     case "azure_openai":
     case "zhipu":
     case "siliconflow":
+    case "deepseek":
+    case "moonshot":
     case "bailian":
     case "cohere":
     case "mistral":
@@ -342,6 +525,8 @@ function callSummarizeTask(cfg: SummarizerConfig, text: string, log: Logger): Pr
     case "azure_openai":
     case "zhipu":
     case "siliconflow":
+    case "deepseek":
+    case "moonshot":
     case "bailian":
     case "cohere":
     case "mistral":
@@ -365,6 +550,8 @@ function callGenerateTaskTitle(cfg: SummarizerConfig, text: string, log: Logger)
     case "azure_openai":
     case "zhipu":
     case "siliconflow":
+    case "deepseek":
+    case "moonshot":
     case "bailian":
     case "cohere":
     case "mistral":
@@ -388,6 +575,8 @@ function callTopicJudge(cfg: SummarizerConfig, currentContext: string, newMessag
     case "azure_openai":
     case "zhipu":
     case "siliconflow":
+    case "deepseek":
+    case "moonshot":
     case "bailian":
     case "cohere":
     case "mistral":
@@ -411,6 +600,8 @@ function callFilterRelevant(cfg: SummarizerConfig, query: string, candidates: Ar
     case "azure_openai":
     case "zhipu":
     case "siliconflow":
+    case "deepseek":
+    case "moonshot":
     case "bailian":
     case "cohere":
     case "mistral":
@@ -434,6 +625,8 @@ function callJudgeDedup(cfg: SummarizerConfig, newSummary: string, candidates: A
     case "azure_openai":
     case "zhipu":
     case "siliconflow":
+    case "deepseek":
+    case "moonshot":
     case "bailian":
     case "cohere":
     case "mistral":
@@ -482,4 +675,3 @@ function wordCount(text: string): number {
   if (noCjk) count += noCjk.split(/\s+/).filter(Boolean).length;
   return count;
 }
-
