@@ -389,7 +389,8 @@ input,textarea,select{font-family:inherit;font-size:inherit}
 .role-tag.assistant{background:var(--accent-glow);color:var(--accent);border:1px solid rgba(230,57,70,.2)}
 .role-tag.system{background:var(--amber-bg);color:var(--amber);border:1px solid rgba(245,158,11,.2)}
 .card-time{font-size:12px;color:var(--text-sec);display:flex;align-items:center;gap:8px}
-.session-tag{font-size:11px;font-family:ui-monospace,monospace;color:var(--text-muted);background:rgba(0,0,0,.2);padding:3px 8px;border-radius:6px;cursor:default}
+.session-tag{font-size:11px;font-family:ui-monospace,monospace;color:var(--text-muted);background:rgba(0,0,0,.2);padding:3px 8px;border-radius:6px;cursor:pointer}
+.session-tag:hover{filter:brightness(1.12)}
 .owner-tag{font-size:11px;font-weight:600;color:var(--pri);background:var(--pri-glow);padding:3px 9px;border-radius:8px;border:1px solid rgba(99,102,241,.15);cursor:default;white-space:nowrap}
 .card-summary{font-size:15px;font-weight:600;color:var(--text);margin-bottom:10px;line-height:1.5;letter-spacing:-.01em;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .card-content{font-size:13px;color:var(--text-sec);line-height:1.65;max-height:0;overflow:hidden;transition:max-height .3s ease}
@@ -650,7 +651,7 @@ input,textarea,select{font-family:inherit;font-size:inherit}
 .task-detail-meta{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px;font-size:12px;color:var(--text-sec)}
 .task-detail-meta .meta-item{display:flex;align-items:center;gap:5px;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:5px 12px}
 .task-detail-summary{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:20px;font-size:13px;line-height:1.7;color:var(--text);word-break:break-word}
-.task-detail-summary:empty::after{content:'Summary not yet generated (task still active)';color:var(--text-muted);font-style:italic}
+#taskDetailSummary:empty::after{content:'Summary not yet generated (task still active)';color:var(--text-muted);font-style:italic}
 .task-detail-summary .summary-section-title{font-size:14px;font-weight:700;color:var(--text);margin:14px 0 6px 0;padding-bottom:4px;border-bottom:1px solid var(--border)}
 .task-detail-summary .summary-section-title:first-child{margin-top:0}
 .task-detail-summary ul{margin:4px 0 8px 0;padding-left:20px}
@@ -2127,6 +2128,9 @@ const I18N={
     'skills.search.noresult':'No matching skills found',
     'skills.load.error':'Failed to load skills',
     'skills.hub.title':'\u{1F310} Team Skills',
+    'skills.hub.empty':'No extra team skills to list here — either the hub has none yet, or every hub skill already appears in your local list above (same source skill).',
+    'skills.hub.loadError':'Failed to load team skills',
+    'skills.hub.timeout':'Team skills request timed out. Check that the Hub is running and connected.',
     'scope.local':'Local',
     'scope.thisAgent':'This Agent Only',
     'scope.thisDevice':'All Local Agents',
@@ -2431,6 +2435,7 @@ const I18N={
     'skills.noversions':'No versions recorded',
     'skills.norelated':'No related tasks',
     'skills.nocontent':'No content available',
+    'skills.hub.markdownPending':'Full SKILL.md is not included in the team list response. Use “Pull to local”, then open the skill from your local list to view markdown, files, and versions.',
     'skills.nochangelog':'No changelog',
     'skills.status.active':'Active',
     'skills.status.draft':'Draft',
@@ -2631,7 +2636,7 @@ const I18N={
     'admin.visibility':'Visibility: ',
     'admin.session':'Session',
     'admin.content':'Content',
-    'admin.chunks':'Chunks: ',
+    'admin.chunks':'{n} memory segments',
     'admin.updated':'Updated: ',
     'admin.sharedSkills':'Shared Skills',
     'admin.noSharedSkills':'No shared skills in team.',
@@ -2896,6 +2901,9 @@ const I18N={
     'skills.search.noresult':'未找到匹配的技能',
     'skills.load.error':'加载技能失败',
     'skills.hub.title':'\u{1F310} 团队共享技能',
+    'skills.hub.empty':'下方只列出「Hub 上有、但上方本机列表尚未包含」的技能；若 Hub 条目已与本机同源同步，则只会在上方显示，此处为空属正常。',
+    'skills.hub.loadError':'加载团队技能失败',
+    'skills.hub.timeout':'加载团队技能超时，请确认团队服务已启动且已连接。',
     'scope.local':'本地',
     'scope.thisAgent':'仅本智能体',
     'scope.thisDevice':'本机所有智能体',
@@ -3200,6 +3208,7 @@ const I18N={
     'skills.noversions':'暂无版本记录',
     'skills.norelated':'暂无关联任务',
     'skills.nocontent':'暂无内容',
+    'skills.hub.markdownPending':'团队列表未返回完整 SKILL.md 正文。请先「拉取到本地」，再在本机技能里打开该技能即可查看正文、文件与版本。',
     'skills.nochangelog':'暂无变更记录',
     'skills.status.active':'生效中',
     'skills.status.draft':'草稿',
@@ -3400,7 +3409,7 @@ const I18N={
     'admin.visibility':'可见性：',
     'admin.session':'会话',
     'admin.content':'内容',
-    'admin.chunks':'记忆片段：',
+    'admin.chunks':'{n}段记忆片段',
     'admin.updated':'更新于：',
     'admin.sharedSkills':'共享技能',
     'admin.noSharedSkills':'团队暂无共享技能。',
@@ -4834,7 +4843,7 @@ function renderAdminTasks(tasks){
           '<div class="admin-card-tags-left">'+
             '<span class="admin-card-tag tag-owner">\u{1F464} '+fmtOwner(tk)+'</span>'+
             (tk.status?'<span class="admin-card-tag tag-status">'+esc(tk.status)+'</span>':'')+
-            (tk.chunkCount!=null?'<span class="admin-card-tag tag-kind">\u{1F4DD} '+tk.chunkCount+' '+t('admin.chunks')+'</span>':'')+
+            (tk.chunkCount!=null?'<span class="admin-card-tag tag-kind">\u{1F4DD} '+t('admin.chunks').replace('{n}',String(tk.chunkCount))+'</span>':'')+
         '</div>'+
           '<span class="admin-card-actions" onclick="event.stopPropagation()">'+
             (window._isHubAdmin?'<button class="btn btn-sm btn-ghost" onclick="adminDeleteTask(&quot;'+escAttr(tk.id)+'&quot;,&quot;'+escAttr(tk.title||tk.id)+'&quot;)" style="color:var(--rose)">'+t('admin.remove')+'</button>':'')+
@@ -5155,7 +5164,7 @@ async function toggleAdminSkillCard(cardId,idx){
   if(files.length>0){
     var fileIcons={'skill':'\u{1F4D6}','script':'\u{2699}','reference':'\u{1F4CE}','file':'\u{1F4C4}'};
     filesHtml='<div class="admin-card-detail-section"><div class="detail-label" style="display:flex;align-items:center;justify-content:space-between">'+t('skills.files')+
-      '<button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();window.open(\\x27/api/skill/'+encodeURIComponent(localSkillId)+'/download\\x27,\\x27_blank\\x27)" style="font-size:11px">\u2B07 '+t('skills.download')+'</button>'+
+      '<button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();window.open(\\x27/api/skill/'+encodeURIComponent(localSkillId)+'/download\\x27,\\x27_blank\\x27)" style="font-size:11px">'+t('skills.download')+'</button>'+
       '</div><div class="skill-files-list">'+
       files.map(function(f){return '<div class="skill-file-item">'+
         '<span class="skill-file-icon">'+(fileIcons[f.type]||'\u{1F4C4}')+'</span>'+
@@ -5343,7 +5352,7 @@ function openHubSkillDetailFromCache(cacheKey,idx){
   document.getElementById('skillDetailMeta').innerHTML=meta.join('');
   document.getElementById('skillDetailDesc').textContent=skill.description||'';
   document.getElementById('skillFilesList').innerHTML='';
-  document.getElementById('skillDetailContent').innerHTML=skill.content?renderSkillMarkdown(skill.content):'';
+  document.getElementById('skillDetailContent').innerHTML=skill.content?renderSkillMarkdown(skill.content):('<span style="color:var(--text-muted);font-size:13px;line-height:1.6">'+t('skills.hub.markdownPending')+'</span>');
   document.getElementById('skillVersionsList').innerHTML='';
   document.getElementById('skillRelatedTasks').innerHTML='';
   var visBtn=document.getElementById('skillVisibilityBtn');
@@ -5369,6 +5378,8 @@ function fmtSessionDisplay(sid){
     var parts=sid.split(':');
     // agent:{agentId}:import → "📥 import"
     if(parts.length===3 && parts[2]==='import') return '\\u{1F4E5} import';
+    // agent:{agentId}:{sessionKey} (exactly 3 segments) → show from second part (e.g. "work:main")
+    if(parts.length===3) return parts.slice(1).join(':');
     // agent:{agentId}:session:{sessionId} → shortened sessionId
     if(parts.length>=4 && parts[2]==='session'){
       var sessId=parts.slice(3).join(':');
@@ -5386,6 +5397,17 @@ function fmtSessionDisplay(sid){
   if(sid.length>20) return sid.slice(0,8)+'..'+sid.slice(-6);
   return sid;
 }
+
+function copySessionKeyFromEl(el){
+  var k=el&&el.getAttribute('data-session-key');
+  if(!k) return;
+  navigator.clipboard.writeText(k).then(function(){
+    toast(t('copy.done'),'success');
+  }).catch(function(){
+    toast('Copy failed','error');
+  });
+}
+
 
 function isImportedSession(sid){
   if(!sid) return false;
@@ -5577,6 +5599,10 @@ function renderSkillShareActions(skill){
 }
 function openSkillScopeModal(){
   if(!currentSkillDetail) return;
+  if(currentSkillDetail.status!=='active'){
+    toast(t('share.scope.skillNotActive'),'warn');
+    return;
+  }
   var skill=currentSkillDetail;
   var isLocalShared=skill.visibility==='public';
   var isTeamShared=!!skill.sharingVisibility;
@@ -6644,7 +6670,6 @@ async function loadSkills(silent){
             (tags.length>0?'<div class="skill-card-tags">'+tags.map(tg=>'<span class="skill-tag">'+esc(tg)+'</span>').join('')+'</div>':'')+
             '<span class="card-actions-inline" onclick="event.stopPropagation()">'+
               '<button class="btn btn-sm btn-ghost" onclick="openSkillDetail(&quot;'+escAttr(skill.id)+'&quot;)">'+t('card.expand')+'</button>'+
-              '<button class="btn btn-sm btn-danger" onclick="deleteSkill(&quot;'+escAttr(skill.id)+'&quot;)">'+t('skill.delete')+'</button>'+
               (skill.status==='active'
                 ?'<button class="btn btn-sm btn-ghost" onclick="openSkillScopeModalFromList(&quot;'+escAttr(skill.id)+'&quot;,&quot;'+skillScope+'&quot;)">\\u270F '+t('share.shareBtn')+'</button>'
                 :'<button class="btn btn-sm btn-ghost" style="opacity:0.45;cursor:not-allowed" onclick="toast(t(\\x27share.scope.skillNotActive\\x27),\\x27warn\\x27)">\\u270F '+t('share.shareBtn')+'</button>')+
@@ -6684,7 +6709,7 @@ async function loadSkills(silent){
     if(!query){
       if(hubSection) hubSection.style.display='block';
       var localIds=new Set(localSkills.map(function(s){return s.id;}));
-      if(hubList){ loadHubSkills(hubList, localIds); }
+      if(hubList){ await loadHubSkills(hubList, localIds); }
       _st('skillsTotalCount',formatNum(localSkills.length));
       _st('skillsActiveCount',formatNum(localSkills.filter(s=>s.status==='active').length));
       _st('skillsDraftCount',formatNum(localSkills.filter(s=>s.status==='draft').length));
@@ -6805,19 +6830,31 @@ async function loadHubSkills(hubList, localIds){
   if(!hubList) return;
   var hubSection=document.getElementById('hubSkillsSection');
   hubList.innerHTML='<div class="spinner"></div>';
+  if(hubSection) hubSection.style.display='block';
   try{
-    const r=await fetch('/api/sharing/skills/list?limit=40');
+    var ctrl=new AbortController();
+    var to=setTimeout(function(){try{ctrl.abort();}catch(x){}},25000);
+    var r;
+    try{
+      r=await fetch('/api/sharing/skills/list?limit=40',{signal:ctrl.signal});
+    }finally{
+      clearTimeout(to);
+    }
+    if(!r.ok){
+      var errBody='';
+      try{errBody=await r.text();}catch(x2){errBody=r.statusText;}
+      throw new Error(errBody||String(r.status));
+    }
     const d=await r.json();
     var allSkills=Array.isArray(d.skills)?d.skills:[];
     const skills=localIds?allSkills.filter(function(s){return !localIds.has(s.sourceSkillId);}):allSkills;
     hubSkillsCache=skills;
     if(!skills.length){
-      if(hubSection) hubSection.style.display='none';
+      hubList.innerHTML='<div style="text-align:center;padding:32px;color:var(--text-muted);font-size:14px">'+t('skills.hub.empty')+'</div>';
       return;
     }
-    if(hubSection) hubSection.style.display='block';
     hubList.innerHTML=skills.map(function(skill,idx){
-      return '<div class="hub-skill-card" onclick="openHubSkillDetailFromCache(\\\'hub\\\',' +idx+')" style="cursor:pointer">'+
+      return '<div class="hub-skill-card" onclick="openHubSkillDetailFromCache(\\x27hub\\x27,'+idx+')" style="cursor:pointer">'+
         '<div class="summary">'+esc(skill.name)+'</div>'+
         '<div class="excerpt">'+esc(skill.description||'')+'</div>'+
         '<div class="hub-skill-meta">'+
@@ -6830,8 +6867,8 @@ async function loadHubSkills(hubList, localIds){
       '</div>';
     }).join('');
   }catch(e){
-    if(hubSection) hubSection.style.display='none';
-    hubList.innerHTML='';
+    var msg=String((e&&e.name==='AbortError')?t('skills.hub.timeout'):(e&&e.message)||e);
+    hubList.innerHTML='<div style="text-align:center;padding:32px;color:var(--rose);font-size:13px">'+esc(t('skills.hub.loadError')+': '+msg)+'</div>';
   }
 }
 
@@ -6896,7 +6933,17 @@ async function openSkillDetail(skillId){
     visBtn.className='skill-vis-btn';
     visBtn.textContent='\\u270F '+t('share.shareBtn');
     visBtn.dataset.vis=detailSkillScope;
-    visBtn.onclick=function(){openSkillScopeModal();};
+    visBtn.style.opacity='';
+    visBtn.style.cursor='';
+    visBtn.style.pointerEvents='';
+    if(skill.status==='active'){
+      visBtn.onclick=function(){openSkillScopeModal();};
+    }else{
+      visBtn.style.opacity='0.45';
+      visBtn.style.cursor='not-allowed';
+      visBtn.style.pointerEvents='auto';
+      visBtn.onclick=function(e){e.stopPropagation();toast(t('share.scope.skillNotActive'),'warn');};
+    }
 
     document.getElementById('skillDetailDesc').textContent=skill.description;
     currentSkillDetail=skill;
@@ -8691,7 +8738,7 @@ function renderMemories(items){
     var ownerName=fmtAgentName(m.owner);
     var ownerBadge=ownerName?'<span class="owner-tag" title="'+esc(m.owner||'')+'">\\u{1F916} '+esc(ownerName)+'</span>':'';
     return '<div class="memory-card'+(isInactive?' dedup-inactive':'')+'">'+
-      '<div class="card-header"><div class="meta"><span class="role-tag '+role+'">'+role+'</span>'+ownerBadge+memScopeBadge+importBadge+dedupBadge+mergeBadge+'</div><span class="card-time"><span class="session-tag" title="'+esc(sid)+'">'+esc(sidShort)+'</span> '+time+updatedAt+'</span></div>'+
+      '<div class="card-header"><div class="meta"><span class="role-tag '+role+'">'+role+'</span>'+ownerBadge+memScopeBadge+importBadge+dedupBadge+mergeBadge+'</div><span class="card-time"><span class="session-tag" data-session-key="'+escAttr(sid)+'" onclick="event.stopPropagation();copySessionKeyFromEl(this)" title="'+esc(sidShort+(sid?' — '+t('copy.hint'):''))+'">'+esc(sidShort)+'</span> '+time+updatedAt+'</span></div>'+
       '<div class="card-summary">'+selectBoxHtml+cardTitle+'</div>'+
       (function(){
         if(mc<=0) return '';
