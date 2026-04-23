@@ -148,16 +148,21 @@ function Update-OpenClawConfig {
   param(
     [string]$OpenClawHome,
     [string]$ConfigPath,
-    [string]$PluginId
+    [string]$PluginId,
+    [string]$InstallPath,
+    [string]$Spec
   )
 
   Write-Info "Updating OpenClaw config..."
   New-Item -ItemType Directory -Path $OpenClawHome -Force | Out-Null
   $nodeScript = @'
 const fs = require("fs");
+const path = require("path");
 
 const configPath = process.argv[2];
 const pluginId = process.argv[3];
+const installPath = process.argv[4];
+const spec = process.argv[5];
 
 let config = {};
 if (fs.existsSync(configPath)) {
@@ -192,9 +197,48 @@ if (config.plugins.slots && config.plugins.slots.contextEngine) {
   }
 }
 
+// Register plugin in memory slot
+if (!config.plugins.slots || typeof config.plugins.slots !== "object") {
+  config.plugins.slots = {};
+}
+config.plugins.slots.memory = pluginId;
+
+// Ensure plugin entry is enabled (preserve existing config if present)
+if (!config.plugins.entries || typeof config.plugins.entries !== "object") {
+  config.plugins.entries = {};
+}
+if (!config.plugins.entries[pluginId] || typeof config.plugins.entries[pluginId] !== "object") {
+  config.plugins.entries[pluginId] = {};
+}
+config.plugins.entries[pluginId].enabled = true;
+
+// Register plugin in installs so gateway auto-loads it on restart (pinned spec when package.json exists)
+if (!config.plugins.installs || typeof config.plugins.installs !== "object") {
+  config.plugins.installs = {};
+}
+let resolvedName = "";
+let resolvedVersion = "";
+const pkgJsonPath = path.join(installPath, "package.json");
+if (fs.existsSync(pkgJsonPath)) {
+  const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf8"));
+  resolvedName = pkg.name;
+  resolvedVersion = pkg.version;
+}
+const pinnedSpec = resolvedName && resolvedVersion ? `${resolvedName}@${resolvedVersion}` : spec;
+config.plugins.installs[pluginId] = {
+  source: "npm",
+  spec: pinnedSpec,
+  installPath,
+  ...(resolvedVersion ? { version: resolvedVersion } : {}),
+  ...(resolvedName ? { resolvedName } : {}),
+  ...(resolvedVersion ? { resolvedVersion } : {}),
+  ...(resolvedName && resolvedVersion ? { resolvedSpec: pinnedSpec } : {}),
+  installedAt: new Date().toISOString(),
+};
+
 fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 '@
-  $nodeScript | & node - $ConfigPath $PluginId
+  $nodeScript | & node - $ConfigPath $PluginId $InstallPath $Spec
   Write-Success "OpenClaw config updated: $ConfigPath"
 }
 
@@ -320,7 +364,61 @@ if (-not (Test-Path $ExtensionDir)) {
   exit 1
 }
 
-Update-OpenClawConfig -OpenClawHome $OpenClawHome -ConfigPath $OpenClawConfigPath -PluginId $PluginId
+$NodeModulesDir = Join-Path $ExtensionDir "node_modules"
+if (-not (Test-Path $NodeModulesDir)) {
+  Write-Warn "node_modules missing after install (postinstall may have cleaned it). Reinstalling..."
+  Push-Location $ExtensionDir
+  try {
+    & npm install --omit=dev --no-fund --no-audit --ignore-scripts --loglevel=error 2>&1
+  }
+  finally {
+    Pop-Location
+  }
+}
 
-Write-Success "Restarting OpenClaw Gateway..."
-& npx openclaw gateway run --port $Port --force
+$SqliteDir = Join-Path $ExtensionDir "node_modules\better-sqlite3"
+if (-not (Test-Path $SqliteDir)) {
+  Write-Warn "better-sqlite3 missing, attempting rebuild..."
+  Push-Location $ExtensionDir
+  try {
+    & npm rebuild better-sqlite3 2>&1
+  }
+  catch {
+    Write-Warn "better-sqlite3 rebuild returned an error. Continuing..."
+  }
+  finally {
+    Pop-Location
+  }
+}
+
+if (-not (Test-Path $NodeModulesDir)) {
+  Write-Err "Dependencies installation failed. Run manually: cd $ExtensionDir && npm install --omit=dev"
+  exit 1
+}
+
+Update-OpenClawConfig -OpenClawHome $OpenClawHome -ConfigPath $OpenClawConfigPath -PluginId $PluginId -InstallPath $ExtensionDir -Spec $PackageSpec
+
+Write-Info "Installing OpenClaw Gateway service..."
+& npx openclaw gateway install --port $Port --force 2>&1
+if (-not $?) { Write-Warn "Gateway service install returned a warning; continuing..." }
+
+Write-Success "Starting OpenClaw Gateway service..."
+& npx openclaw gateway start 2>&1
+
+Write-Info "Starting Memory Viewer, 正在启动记忆面板..."
+for ($i = 1; $i -le 5; $i++) {
+  $listening = Get-NetTCPConnection -LocalPort 18799 -State Listen -ErrorAction SilentlyContinue
+  if ($listening) { break }
+  Write-Host "." -NoNewline
+  Start-Sleep -Seconds 1
+}
+Write-Host ""
+
+Write-Host ""
+Write-Success "=========================================="
+Write-Success "  Installation complete! 安装完成!"
+Write-Success "=========================================="
+Write-Host ""
+Write-Info "  OpenClaw Web UI:      http://localhost:$Port"
+Write-Info "  Memory Viewer:        http://localhost:18799"
+Write-Host ""
