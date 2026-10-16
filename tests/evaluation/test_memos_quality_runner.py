@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 
-from typing import TYPE_CHECKING
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
@@ -14,10 +16,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from evaluation.quality_runner.memos_quality_runner import (
+    MAX_EVIDENCE_REFS,
+    MAX_TARGET_OUTPUT_BYTES,
     QualityPackError,
     _canonical_json,
     load_quality_dataset,
     run_fixture_validation,
+    run_live_evaluation,
     write_report,
 )
 
@@ -127,3 +132,201 @@ def test_rejects_hash_mismatch_and_unsafe_path(tmp_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(QualityPackError, match="SHA-256"):
         load_quality_dataset(root, "memos-golden-recall-v0")
+
+
+class _MockTargetHandler(BaseHTTPRequestHandler):
+    calls: ClassVar[list[dict[str, Any]]] = []
+    response_mode = "valid"
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        self.__class__.calls.append(
+            {
+                "payload": payload,
+                "authorization": self.headers.get("Authorization"),
+            }
+        )
+        sample_id = payload["sampleId"]
+        if self.response_mode == "mismatch":
+            sample_id = "unexpected-sample"
+        response = {
+            "sampleId": sample_id,
+            "targetOutput": f"answer for {payload['query']}",
+            "evidenceRefs": [f"target:{sample_id}:1"],
+            "latencyMs": 12.5,
+            "inputTokens": 7,
+            "outputTokens": 9,
+            "costMicros": 3,
+        }
+        if self.response_mode == "missing-observability":
+            response.pop("latencyMs")
+            response.pop("inputTokens")
+            response.pop("outputTokens")
+            response.pop("costMicros")
+        if self.response_mode == "invalid-output":
+            response["targetOutput"] = ""
+        if self.response_mode == "oversized-output":
+            response["targetOutput"] = "x" * (MAX_TARGET_OUTPUT_BYTES + 1)
+        if self.response_mode == "too-many-evidence-refs":
+            response["evidenceRefs"] = ["ref"] * (MAX_EVIDENCE_REFS + 1)
+        encoded = json.dumps(response).encode("utf-8")
+        self.send_response(200)
+        content_type = (
+            "text/plain" if self.response_mode == "bad-content-type" else "application/json"
+        )
+        self.send_header("Content-Type", content_type)
+        content_length = (
+            "invalid" if self.response_mode == "bad-content-length" else str(len(encoded))
+        )
+        self.send_header("Content-Length", content_length)
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: Any) -> None:
+        return
+
+
+@pytest.fixture
+def mock_target() -> Any:
+    _MockTargetHandler.calls = []
+    _MockTargetHandler.response_mode = "valid"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _MockTargetHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, _MockTargetHandler
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_live_runner_calls_explicit_target_and_keeps_observability_fields(
+    tmp_path: Path, mock_target: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, handler = mock_target
+    monkeypatch.setenv("MEMOS_TEST_EVAL_TOKEN", "local-only-token")
+    dataset = load_quality_dataset(_fixture(tmp_path), "memos-golden-recall-v0")
+    report = run_live_evaluation(
+        dataset,
+        target_url=f"http://127.0.0.1:{server.server_port}/evaluate",
+        token_env="MEMOS_TEST_EVAL_TOKEN",
+        timeout_seconds=2,
+        run_id="eval-live-test",
+    )
+
+    assert report["run"]["mode"] == "live"
+    assert report["run"]["result"] == "available"
+    assert report["run"]["completedItemCount"] == 2
+    assert report["scorecard"]["status"] == "not_scored"
+    assert [item["targetOutput"] for item in report["items"]] == [
+        "answer for What is remembered 1?",
+        "answer for What is remembered 2?",
+    ]
+    assert all(item["evidenceRefs"] for item in report["items"])
+    assert all(item["targetLatencyMs"] == 12.5 for item in report["items"])
+    assert all(item["inputTokens"] == 7 for item in report["items"])
+    assert all(item["outputTokens"] == 9 for item in report["items"])
+    assert all(item["costMicros"] == 3 for item in report["items"])
+    assert len(handler.calls) == 2
+    assert all(call["authorization"] == "Bearer local-only-token" for call in handler.calls)
+    assert all("goldenAnswer" not in call["payload"] for call in handler.calls)
+    serialized = json.dumps(report, ensure_ascii=False)
+    assert "local-only-token" not in serialized
+
+
+def test_live_runner_fails_closed_on_sample_binding_error(
+    tmp_path: Path, mock_target: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, handler = mock_target
+    handler.response_mode = "mismatch"
+    monkeypatch.setenv("MEMOS_TEST_EVAL_TOKEN", "local-only-token")
+    dataset = load_quality_dataset(_fixture(tmp_path), "memos-golden-recall-v0")
+    with pytest.raises(QualityPackError, match="sampleId"):
+        run_live_evaluation(
+            dataset,
+            target_url=f"http://127.0.0.1:{server.server_port}/evaluate",
+            token_env="MEMOS_TEST_EVAL_TOKEN",
+            timeout_seconds=2,
+        )
+
+
+def test_live_runner_keeps_missing_observability_fields_null(
+    tmp_path: Path, mock_target: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, handler = mock_target
+    handler.response_mode = "missing-observability"
+    monkeypatch.setenv("MEMOS_TEST_EVAL_TOKEN", "local-only-token")
+    dataset = load_quality_dataset(_fixture(tmp_path), "memos-golden-recall-v0")
+    report = run_live_evaluation(
+        dataset,
+        target_url=f"http://127.0.0.1:{server.server_port}/evaluate",
+        token_env="MEMOS_TEST_EVAL_TOKEN",
+        timeout_seconds=2,
+    )
+    assert all(item["targetLatencyMs"] is None for item in report["items"])
+    assert all(item["inputTokens"] is None for item in report["items"])
+    assert report["scorecard"]["metrics"]["targetLatencyP95Ms"] is None
+    assert report["scorecard"]["metrics"]["inputTokensTotal"] is None
+
+
+def test_live_runner_fails_closed_on_protocol_and_network_errors(
+    tmp_path: Path, mock_target: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, handler = mock_target
+    handler.response_mode = "bad-content-type"
+    monkeypatch.setenv("MEMOS_TEST_EVAL_TOKEN", "local-only-token")
+    dataset = load_quality_dataset(_fixture(tmp_path), "memos-golden-recall-v0")
+    with pytest.raises(QualityPackError, match="Content-Type"):
+        run_live_evaluation(
+            dataset,
+            target_url=f"http://127.0.0.1:{server.server_port}/evaluate",
+            token_env="MEMOS_TEST_EVAL_TOKEN",
+            timeout_seconds=2,
+        )
+    handler.response_mode = "bad-content-length"
+    with pytest.raises(QualityPackError, match="Content-Length"):
+        run_live_evaluation(
+            dataset,
+            target_url=f"http://127.0.0.1:{server.server_port}/evaluate",
+            token_env="MEMOS_TEST_EVAL_TOKEN",
+            timeout_seconds=2,
+        )
+    handler.response_mode = "bad-content-type"
+    with pytest.raises(QualityPackError, match="网络请求"):
+        run_live_evaluation(
+            dataset,
+            target_url="http://127.0.0.1:1/evaluate",
+            token_env="MEMOS_TEST_EVAL_TOKEN",
+            timeout_seconds=0.2,
+        )
+
+
+def test_live_runner_bounds_target_output_and_evidence_refs(
+    tmp_path: Path, mock_target: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, handler = mock_target
+    monkeypatch.setenv("MEMOS_TEST_EVAL_TOKEN", "local-only-token")
+    dataset = load_quality_dataset(_fixture(tmp_path), "memos-golden-recall-v0")
+    for mode, message in (
+        ("invalid-output", "targetOutput"),
+        ("oversized-output", "targetOutput"),
+        ("too-many-evidence-refs", "evidenceRefs"),
+    ):
+        handler.response_mode = mode
+        with pytest.raises(QualityPackError, match=message):
+            run_live_evaluation(
+                dataset,
+                target_url=f"http://127.0.0.1:{server.server_port}/evaluate",
+                token_env="MEMOS_TEST_EVAL_TOKEN",
+                timeout_seconds=2,
+            )
+
+
+def test_live_runner_requires_explicit_target_and_token_env(tmp_path: Path) -> None:
+    dataset = load_quality_dataset(_fixture(tmp_path), "memos-golden-recall-v0")
+    with pytest.raises(QualityPackError, match="target URL"):
+        run_live_evaluation(dataset, target_url="")
+    with pytest.raises(QualityPackError, match="环境变量"):
+        run_live_evaluation(dataset, target_url="http://127.0.0.1:1/evaluate", token_env="MISSING")

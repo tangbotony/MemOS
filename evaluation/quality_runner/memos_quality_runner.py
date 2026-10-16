@@ -1,10 +1,10 @@
 """Run the MemOS Quality Pack through the common EvaluationRun contract.
 
-This adapter deliberately implements fixture validation only.  It does not call
-an LLM, a MemOS service, or a network endpoint.  ``shadow`` and ``mock`` runs
-therefore report ``not_available`` for model outcomes while still producing
-auditable dataset hashes and per-sample fixture coverage.  A live model
-adapter can be added later without changing the report shape.
+``shadow`` and ``mock`` are local, no-network fixture checks.  ``live`` is an
+explicit HTTP JSON adapter for a caller-owned evaluation target.  It only
+executes when a URL is supplied and reads the optional Bearer credential from
+an environment variable; malformed, unbound, or failed target responses abort
+the complete run instead of producing a partial quality report.
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
 import tempfile
 import time
 
@@ -19,18 +21,24 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 if TYPE_CHECKING:
-    import os
-
     from collections.abc import Iterable, Mapping
 
 
 RUNNER_ID = "memos-eval-runner"
 RUNNER_VERSION = "0.1.0"
 REPORT_SCHEMA_VERSION = "evaluation-run.v1"
-SUPPORTED_MODES = ("shadow", "mock")
+SUPPORTED_MODES = ("shadow", "mock", "live")
+DEFAULT_TOKEN_ENV = "MEMOS_EVAL_TARGET_TOKEN"
+MAX_TARGET_RESPONSE_BYTES = 1_048_576
+MAX_TARGET_OUTPUT_BYTES = 262_144
+MAX_EVIDENCE_REFS = 64
+MAX_EVIDENCE_REF_LENGTH = 1_024
 MAX_MANIFEST_DEPTH = 8
 
 
@@ -251,6 +259,7 @@ def _item(sample: Mapping[str, Any], mode: str) -> dict[str, Any]:
         "outcome": "inconclusive",
         "fixtureMatch": "pass",
         "evidenceRefCount": len(sample["evidenceRefs"]),
+        "evidenceRefs": None,
         "targetOutput": None,
         "targetLatencyMs": None,
         "inputTokens": None,
@@ -258,6 +267,273 @@ def _item(sample: Mapping[str, Any], mode: str) -> dict[str, Any]:
         "costMicros": None,
         "error": f"mode={mode}: model execution intentionally skipped; no quality score produced",
     }
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Reject redirects so the configured target remains the only endpoint."""
+
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        raise QualityPackError("live target 返回重定向，拒绝继续请求。")
+
+
+def _validate_optional_number(
+    value: Any, field: str, *, integer: bool = False
+) -> int | float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise QualityPackError(f"live target 字段 {field} 必须是非负数字或 null。")
+    if not math.isfinite(value) or value < 0 or (integer and not isinstance(value, int)):
+        raise QualityPackError(f"live target 字段 {field} 必须是非负数字或 null。")
+    return value
+
+
+def _validate_target_url(target_url: str) -> str:
+    if not isinstance(target_url, str) or not target_url.strip():
+        raise QualityPackError("live target URL 必须显式提供。")
+    parsed = urlsplit(target_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise QualityPackError("live target URL 必须是带主机的 http(s) URL。")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise QualityPackError("live target URL 不得包含凭据或 fragment。")
+    return target_url
+
+
+def _target_payload(dataset: LoadedDataset, sample: Mapping[str, Any], run_id: str) -> bytes:
+    """Encode only target inputs; golden answers never leave the runner."""
+
+    return _canonical_json(
+        {
+            "schemaVersion": "memos-eval-target-request.v1",
+            "runId": run_id,
+            "sampleId": sample["id"],
+            "productId": dataset.product_id,
+            "datasetId": dataset.dataset_id,
+            "datasetVersion": dataset.version,
+            "datasetContentHash": dataset.dataset_content_hash,
+            "query": sample["query"],
+            "memories": sample["memories"],
+        }
+    )
+
+
+def _request_target(
+    dataset: LoadedDataset,
+    sample: Mapping[str, Any],
+    *,
+    target_url: str,
+    run_id: str,
+    token: str | None,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    payload = _target_payload(dataset, sample, run_id)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-MemOS-Eval-Run-ID": run_id,
+        "X-MemOS-Quality-Pack-Sample-ID": sample["id"],
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = Request(target_url, data=payload, headers=headers, method="POST")
+    opener = build_opener(_NoRedirect())
+    try:
+        with opener.open(request, timeout=timeout_seconds) as response:
+            if response.status < 200 or response.status >= 300:
+                raise QualityPackError(f"live target HTTP 状态异常: {response.status}")
+            if response.headers.get_content_type() != "application/json":
+                raise QualityPackError("live target 响应 Content-Type 必须是 application/json。")
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    declared_length = int(content_length)
+                except ValueError as exc:
+                    raise QualityPackError("live target Content-Length 无效。") from exc
+                if declared_length < 0 or declared_length > MAX_TARGET_RESPONSE_BYTES:
+                    raise QualityPackError("live target 响应过大，拒绝读取。")
+            raw = response.read(MAX_TARGET_RESPONSE_BYTES + 1)
+    except QualityPackError:
+        raise
+    except HTTPError as exc:
+        raise QualityPackError(f"live target HTTP 请求失败: {exc.code}") from exc
+    except (TimeoutError, OSError, URLError) as exc:
+        raise QualityPackError("live target 网络请求失败。") from exc
+    if len(raw) > MAX_TARGET_RESPONSE_BYTES:
+        raise QualityPackError("live target 响应过大，拒绝读取。")
+    try:
+        response_body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QualityPackError("live target 响应不是有效 UTF-8 JSON。") from exc
+    if not isinstance(response_body, dict):
+        raise QualityPackError("live target 响应必须是 JSON 对象。")
+    return response_body
+
+
+def _live_item(sample: Mapping[str, Any], response_body: Mapping[str, Any]) -> dict[str, Any]:
+    expected_id = sample["id"]
+    if response_body.get("sampleId") != expected_id:
+        raise QualityPackError(f"live target sampleId 未绑定当前样本: expected={expected_id}")
+    target_output = response_body.get("targetOutput")
+    if not isinstance(target_output, str) or not target_output.strip():
+        raise QualityPackError(f"live target 样本 {expected_id} 缺少 targetOutput。")
+    if len(target_output.encode("utf-8")) > MAX_TARGET_OUTPUT_BYTES:
+        raise QualityPackError(f"live target 样本 {expected_id} 的 targetOutput 过大。")
+    evidence_refs = response_body.get("evidenceRefs")
+    if not isinstance(evidence_refs, list) or not all(
+        isinstance(ref, str) and ref.strip() and len(ref) <= MAX_EVIDENCE_REF_LENGTH
+        for ref in evidence_refs
+    ):
+        raise QualityPackError(f"live target 样本 {expected_id} 的 evidenceRefs 无效。")
+    if len(evidence_refs) > MAX_EVIDENCE_REFS:
+        raise QualityPackError(f"live target 样本 {expected_id} 的 evidenceRefs 过多。")
+    return {
+        "id": expected_id,
+        "status": "completed",
+        "outcome": "observed",
+        "fixtureMatch": "pass",
+        "evidenceRefCount": len(evidence_refs),
+        "evidenceRefs": evidence_refs,
+        "targetOutput": target_output,
+        "targetLatencyMs": _validate_optional_number(response_body.get("latencyMs"), "latencyMs"),
+        "inputTokens": _validate_optional_number(
+            response_body.get("inputTokens"), "inputTokens", integer=True
+        ),
+        "outputTokens": _validate_optional_number(
+            response_body.get("outputTokens"), "outputTokens", integer=True
+        ),
+        "costMicros": _validate_optional_number(
+            response_body.get("costMicros"), "costMicros", integer=True
+        ),
+        "error": None,
+    }
+
+
+def _p95(values: list[float | int]) -> float | int | None:
+    if not values:
+        return None
+    return sorted(values)[max(0, math.ceil(len(values) * 0.95) - 1)]
+
+
+def run_live_evaluation(
+    dataset: LoadedDataset,
+    *,
+    target_url: str,
+    token_env: str = DEFAULT_TOKEN_ENV,
+    timeout_seconds: float = 15.0,
+    run_id: str | None = None,
+    target_revision: str | None = None,
+    model_version: str | None = None,
+    prompt_version: str | None = None,
+    rag_version: str | None = None,
+    quality_profile_sha: str | None = None,
+) -> dict[str, Any]:
+    """Execute every sample against an explicit HTTP target, fail closed."""
+
+    target_url = _validate_target_url(target_url)
+    if not isinstance(timeout_seconds, int | float) or isinstance(timeout_seconds, bool):
+        raise QualityPackError("live target timeout 必须是正数。")
+    if timeout_seconds <= 0 or not math.isfinite(timeout_seconds):
+        raise QualityPackError("live target timeout 必须是正数。")
+    if dataset.status == "retired":
+        raise QualityPackError("retired Quality Pack 不允许执行 live evaluation。")
+    if not isinstance(token_env, str) or not token_env.strip():
+        raise QualityPackError("live target token 环境变量名必须显式提供。")
+    token = os.environ.get(token_env)
+    if token is None or not token.strip():
+        raise QualityPackError(f"live target token 环境变量缺失: {token_env}")
+    started_at = _utc_now()
+    started_clock = time.perf_counter()
+    run_id = run_id or f"eval-{dataset.dataset_id}-{dataset.dataset_content_hash[:12]}"
+    items: list[dict[str, Any]] = []
+    for sample in dataset.samples:
+        response_body = _request_target(
+            dataset,
+            sample,
+            target_url=target_url,
+            run_id=run_id,
+            token=token,
+            timeout_seconds=float(timeout_seconds),
+        )
+        items.append(_live_item(sample, response_body))
+    execution_duration_ms = round((time.perf_counter() - started_clock) * 1000, 3)
+    count = len(items)
+    latency_values = [
+        item["targetLatencyMs"] for item in items if item["targetLatencyMs"] is not None
+    ]
+    input_values = [item["inputTokens"] for item in items]
+    output_values = [item["outputTokens"] for item in items]
+    cost_values = [item["costMicros"] for item in items]
+    scorecard = {
+        "status": "not_scored",
+        "metrics": {
+            "fixtureSampleCount": count,
+            "fixtureValidCount": count,
+            "fixtureCoverage": 1.0 if count else 0.0,
+            "fixtureMatchCount": count,
+            "fixtureMatchRate": 1.0 if count else 0.0,
+            "observedItemCount": count,
+            "targetLatencyP95Ms": _p95(latency_values),
+            "inputTokensTotal": sum(input_values)
+            if all(value is not None for value in input_values)
+            else None,
+            "outputTokensTotal": sum(output_values)
+            if all(value is not None for value in output_values)
+            else None,
+            "costMicrosTotal": sum(cost_values)
+            if all(value is not None for value in cost_values)
+            else None,
+        },
+        "notes": [
+            "live target outputs and evidenceRefs were captured, but no quality score was computed by this adapter.",
+            "goldenAnswer and acceptableAnswers are never sent to the target; scoring must be performed by a trusted evaluator.",
+            "missing target latency/token/cost fields remain null and do not imply a zero value.",
+        ],
+    }
+    run = {
+        "id": run_id,
+        "status": "completed",
+        "result": "available",
+        "mode": "live",
+        "productId": dataset.product_id,
+        "datasetId": dataset.dataset_id,
+        "datasetVersion": dataset.version,
+        "datasetStatus": dataset.status,
+        "datasetContentHash": dataset.dataset_content_hash,
+        "qualityProfileSha": quality_profile_sha,
+        "target": {
+            "adapter": "http-json-v1",
+            "revision": target_revision,
+            "modelVersion": model_version,
+            "promptVersion": prompt_version,
+            "ragVersion": rag_version,
+        },
+        "runner": {"id": RUNNER_ID, "version": RUNNER_VERSION},
+        "startedAt": started_at,
+        "completedAt": _utc_now(),
+        "executionDurationMs": execution_duration_ms,
+        "itemCount": count,
+        "completedItemCount": count,
+        "failedItemCount": 0,
+    }
+    body = {
+        "schemaVersion": REPORT_SCHEMA_VERSION,
+        "run": run,
+        "qualityPack": {
+            "manifestPath": dataset.manifest_path.as_posix(),
+            "manifestSha256": dataset.manifest_sha256,
+            "files": list(dataset.files),
+        },
+        "items": items,
+        "scorecard": scorecard,
+    }
+    report_sha = _sha256(_canonical_json(body))
+    body["report"] = {
+        "format": "json",
+        "schemaVersion": REPORT_SCHEMA_VERSION,
+        "sha256": report_sha,
+    }
+    body["reportSha256"] = report_sha
+    return body
 
 
 def run_fixture_validation(
@@ -364,7 +640,7 @@ def write_report(report: Mapping[str, Any], output_path: str | os.PathLike[str])
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="MemOS Quality Pack shadow/mock EvaluationRun runner"
+        description="MemOS Quality Pack shadow/mock/live EvaluationRun runner"
     )
     parser.add_argument("--quality-packs-root", required=True, type=Path)
     parser.add_argument("--dataset-id", default="memos-golden-recall-v0")
@@ -376,21 +652,48 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-version")
     parser.add_argument("--rag-version")
     parser.add_argument("--quality-profile-sha")
+    parser.add_argument(
+        "--target-url",
+        help="live 模式的显式 HTTP JSON target URL；shadow/mock 不访问网络",
+    )
+    parser.add_argument(
+        "--target-token-env",
+        default=DEFAULT_TOKEN_ENV,
+        help=f"从此环境变量读取 live Bearer token（默认 {DEFAULT_TOKEN_ENV}）",
+    )
+    parser.add_argument("--target-timeout-seconds", type=float, default=15.0)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    report = run_fixture_validation(
-        load_quality_dataset(args.quality_packs_root, args.dataset_id),
-        mode=args.mode,
-        run_id=args.run_id,
-        target_revision=args.target_revision,
-        model_version=args.model_version,
-        prompt_version=args.prompt_version,
-        rag_version=args.rag_version,
-        quality_profile_sha=args.quality_profile_sha,
-    )
+    dataset = load_quality_dataset(args.quality_packs_root, args.dataset_id)
+    if args.mode == "live":
+        if not args.target_url:
+            raise QualityPackError("live 模式必须提供 --target-url。")
+        report = run_live_evaluation(
+            dataset,
+            target_url=args.target_url,
+            token_env=args.target_token_env,
+            timeout_seconds=args.target_timeout_seconds,
+            run_id=args.run_id,
+            target_revision=args.target_revision,
+            model_version=args.model_version,
+            prompt_version=args.prompt_version,
+            rag_version=args.rag_version,
+            quality_profile_sha=args.quality_profile_sha,
+        )
+    else:
+        report = run_fixture_validation(
+            dataset,
+            mode=args.mode,
+            run_id=args.run_id,
+            target_revision=args.target_revision,
+            model_version=args.model_version,
+            prompt_version=args.prompt_version,
+            rag_version=args.rag_version,
+            quality_profile_sha=args.quality_profile_sha,
+        )
     if args.output:
         write_report(report, args.output)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
