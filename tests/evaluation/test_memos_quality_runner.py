@@ -138,7 +138,7 @@ class _MockTargetHandler(BaseHTTPRequestHandler):
     calls: ClassVar[list[dict[str, Any]]] = []
     response_mode = "valid"
 
-    def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+    def do_post(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length))
         self.__class__.calls.append(
@@ -182,6 +182,8 @@ class _MockTargetHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", content_length)
         self.end_headers()
         self.wfile.write(encoded)
+
+    do_POST = do_post  # noqa: N815 - stdlib handler API
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
