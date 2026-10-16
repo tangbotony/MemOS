@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+
+from typing import TYPE_CHECKING
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from evaluation.quality_runner.memos_quality_runner import (
     QualityPackError,
@@ -36,7 +41,9 @@ def _fixture(tmp_path: Path, *, sample_count: int = 2) -> Path:
                 "evidenceRefs": ["D1:1"],
             }
         )
-    encoded = "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows).encode("utf-8")
+    encoded = "".join(
+        json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows
+    ).encode("utf-8")
     samples_path = dataset_dir / "samples.jsonl"
     samples_path.write_bytes(encoded)
     manifest = {
@@ -120,4 +127,3 @@ def test_rejects_hash_mismatch_and_unsafe_path(tmp_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(QualityPackError, match="SHA-256"):
         load_quality_dataset(root, "memos-golden-recall-v0")
-

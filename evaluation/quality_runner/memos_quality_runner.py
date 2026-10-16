@@ -12,13 +12,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import tempfile
 import time
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any
+
+
+if TYPE_CHECKING:
+    import os
+
+    from collections.abc import Iterable, Mapping
 
 
 RUNNER_ID = "memos-eval-runner"
@@ -133,11 +139,15 @@ def _validate_sample(
     ):
         raise QualityPackError(f"样本 {sample['id']} 的 evidenceRefs 结构无效。")
     acceptable = sample.get("acceptableAnswers", [])
-    if not isinstance(acceptable, list) or not all(isinstance(answer, str) for answer in acceptable):
+    if not isinstance(acceptable, list) or not all(
+        isinstance(answer, str) for answer in acceptable
+    ):
         raise QualityPackError(f"样本 {sample['id']} 的 acceptableAnswers 结构无效。")
 
 
-def load_quality_dataset(quality_packs_root: str | os.PathLike[str], dataset_id: str) -> LoadedDataset:
+def load_quality_dataset(
+    quality_packs_root: str | os.PathLike[str], dataset_id: str
+) -> LoadedDataset:
     """Load and hash exactly one Quality Pack dataset.
 
     The declared file SHA-256, line count, sample count, IDs, and sample
@@ -214,7 +224,7 @@ def load_quality_dataset(quality_packs_root: str | os.PathLike[str], dataset_id:
     if sample_count != len(samples):
         raise QualityPackError("manifest.sampleCount 与实际样本数不一致。")
     file_digests = "\n".join(f"{item['path']}:{item['sha256']}" for item in file_records)
-    content_input = f"{dataset_id}\n{file_digests}\n{len(samples)}".encode("utf-8")
+    content_input = f"{dataset_id}\n{file_digests}\n{len(samples)}".encode()
     return LoadedDataset(
         dataset_id=dataset_id,
         product_id=product_id,
@@ -353,7 +363,9 @@ def write_report(report: Mapping[str, Any], output_path: str | os.PathLike[str])
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="MemOS Quality Pack shadow/mock EvaluationRun runner")
+    parser = argparse.ArgumentParser(
+        description="MemOS Quality Pack shadow/mock EvaluationRun runner"
+    )
     parser.add_argument("--quality-packs-root", required=True, type=Path)
     parser.add_argument("--dataset-id", default="memos-golden-recall-v0")
     parser.add_argument("--mode", choices=SUPPORTED_MODES, default="shadow")
