@@ -65,3 +65,24 @@ dataset 绑定、`query`、`memories` 及 Quality Pack content hash；不会包�
 不能把 `fixtureMatchRate` 当作产品质量分数或准出证据；也不能把 `live` 的
 `result: available` 解读为质量通过。生产接入前仍需要绑定目标服务的身份、网络策略、
 可信评分服务和正式 Gate。
+
+## MemMate 本机隔离闭环
+
+`memos_local_isolated_eval.py` 是面向 MemMate 本地服务的 disposable smoke runner。它只接受 loopback URL（默认 `http://127.0.0.1:19760`），从 `MEMMY_MEMORY_TOKEN` 环境变量读取 token，不接受命令行 token，也不会连接云端地址。
+
+每次运行生成唯一的 `quality-eval-shadow` namespace 和合成记忆，按以下顺序执行：
+
+1. 在唯一 namespace 中预检检索，确认本次 marker 不存在；
+2. `POST /api/v1/memory/add` 写入合成样本并等待 `processing/status` 到达 `ready`；
+3. 在相同 namespace 中检索，要求返回本次 memory ID；
+4. `DELETE /api/v1/memory/:id`，随后用 `GET` 返回 404 和再次检索不再出现 marker 做清理核验。
+
+`ready` 与检索命中只说明本机处理链路和 recall 可用，不是黄金数据集分数、质量准出或生产 Gate。运行示例：
+
+```bash
+MEMMY_MEMORY_TOKEN="$MEMMY_MEMORY_TOKEN" python -m evaluation.quality_runner.memos_local_isolated_eval \
+  --base-url http://127.0.0.1:19760 \
+  --output reports/memos-local-isolated-eval-live-YYYY-MM-DD.json
+```
+
+报告只保存服务版本、namespace 标识、状态和内容哈希，不保存 token 或原始记忆内容。若 token 缺失、服务不健康、处理未进入 ready、检索未命中或删除核验失败，runner 会 fail closed；即使中途失败，也会在已拿到 memory ID 时尝试清理。
