@@ -31,8 +31,12 @@ if TYPE_CHECKING:
 
 
 RUNNER_ID = "memos-eval-runner"
-RUNNER_VERSION = "0.1.0"
+RUNNER_VERSION = "0.2.0"
 REPORT_SCHEMA_VERSION = "evaluation-run.v1"
+EVIDENCE_SCHEMA_VERSION = "evaluation-run-evidence.v1"
+RUNNER_ADAPTER = "memos://evaluation/quality_runner"
+RUNNER_ENTRYPOINT = "evaluation/quality_runner/memos_quality_runner.py"
+RUNNER_OUTPUT_CONTRACT = "badcase://evaluation-run/per-sample-v1"
 SUPPORTED_MODES = ("shadow", "mock", "live")
 DEFAULT_TOKEN_ENV = "MEMOS_EVAL_TARGET_TOKEN"
 MAX_TARGET_RESPONSE_BYTES = 1_048_576
@@ -57,6 +61,7 @@ class LoadedDataset:
     manifest_path: Path
     manifest_sha256: str
     dataset_content_hash: str
+    sample_ids: tuple[str, ...]
     files: tuple[Mapping[str, Any], ...]
     samples: tuple[Mapping[str, Any], ...]
 
@@ -190,6 +195,9 @@ def load_quality_dataset(
     files = manifest.get("files")
     if not isinstance(files, list) or not files:
         raise QualityPackError("manifest.files 必须是非空数组。")
+    declared_content_hash = manifest.get("contentHash")
+    if not isinstance(declared_content_hash, str) or not _is_sha256(declared_content_hash):
+        raise QualityPackError("manifest.contentHash 必须是 64 位小写 SHA-256。")
 
     samples: list[Mapping[str, Any]] = []
     file_records: list[Mapping[str, Any]] = []
@@ -231,8 +239,13 @@ def load_quality_dataset(
     sample_count = manifest.get("sampleCount")
     if sample_count != len(samples):
         raise QualityPackError("manifest.sampleCount 与实际样本数不一致。")
-    file_digests = "\n".join(f"{item['path']}:{item['sha256']}" for item in file_records)
-    content_input = f"{dataset_id}\n{file_digests}\n{len(samples)}".encode()
+    matching_content_files = [
+        item for item in file_records if item["sha256"] == declared_content_hash
+    ]
+    if len(matching_content_files) != 1:
+        raise QualityPackError(
+            "manifest.contentHash 必须精确匹配一个已读取质量包文件的 SHA-256。"
+        )
     return LoadedDataset(
         dataset_id=dataset_id,
         product_id=product_id,
@@ -240,14 +253,87 @@ def load_quality_dataset(
         status=status,
         manifest_path=manifest_path,
         manifest_sha256=_sha256(manifest_path.read_bytes()),
-        dataset_content_hash=_sha256(content_input),
+        dataset_content_hash=declared_content_hash,
+        sample_ids=tuple(sample["id"] for sample in samples),
         files=tuple(file_records),
         samples=tuple(samples),
     )
 
 
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _trace_id(run_id: str, sample_id: str) -> str:
+    """Return the stable trace binding expected from the evaluation target."""
+
+    return f"{run_id}:{sample_id}"
+
+
+def _runner_manifest(mode: str) -> dict[str, Any]:
+    """Describe the executable contract consumed by Badcase/QCP adapters."""
+
+    return {
+        "runnerId": RUNNER_ID,
+        "adapter": RUNNER_ADAPTER,
+        "version": RUNNER_VERSION,
+        "entrypoint": RUNNER_ENTRYPOINT,
+        "executionMode": "controlled",
+        "networkRequired": mode == "live",
+        "outputContract": RUNNER_OUTPUT_CONTRACT,
+        "command": (
+            "python -m evaluation.quality_runner.memos_quality_runner "
+            "--quality-packs-root $QUALITY_PACKS_ROOT "
+            "--dataset-id $DATASET_ID --mode " + mode
+        ),
+    }
+
+
+def _quality_pack_block(dataset: LoadedDataset) -> dict[str, Any]:
+    return {
+        "manifestPath": dataset.manifest_path.as_posix(),
+        "manifestSha256": dataset.manifest_sha256,
+        "datasetId": dataset.dataset_id,
+        "version": dataset.version,
+        "status": dataset.status,
+        "contentHash": dataset.dataset_content_hash,
+        "sampleIds": list(dataset.sample_ids),
+        "files": list(dataset.files),
+    }
+
+
+def _evidence_block(
+    dataset: LoadedDataset,
+    *,
+    run_id: str,
+    items: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    failed = sum(
+        item.get("status") == "failed"
+        or item.get("outcome") in {"fail", "error"}
+        for item in items
+    )
+    inconclusive = sum(item.get("outcome") == "inconclusive" for item in items)
+    return {
+        "schemaVersion": EVIDENCE_SCHEMA_VERSION,
+        "evaluationRunId": run_id,
+        "traceId": run_id,
+        "datasetId": dataset.dataset_id,
+        "datasetVersion": dataset.version,
+        "datasetContentHash": dataset.dataset_content_hash,
+        "sampleIds": list(dataset.sample_ids),
+        "itemCount": len(items),
+        "completedItemCount": sum(item.get("status") == "completed" for item in items),
+        "failedItemCount": failed,
+        "inconclusiveItemCount": inconclusive,
+        "observedTraceCount": sum(bool(item.get("traceId")) for item in items),
+    }
 
 
 def _item(sample: Mapping[str, Any], mode: str) -> dict[str, Any]:
@@ -260,6 +346,7 @@ def _item(sample: Mapping[str, Any], mode: str) -> dict[str, Any]:
         "fixtureMatch": "pass",
         "evidenceRefCount": len(sample["evidenceRefs"]),
         "evidenceRefs": None,
+        "traceId": None,
         "targetOutput": None,
         "targetLatencyMs": None,
         "inputTokens": None,
@@ -306,6 +393,7 @@ def _target_payload(dataset: LoadedDataset, sample: Mapping[str, Any], run_id: s
         {
             "schemaVersion": "memos-eval-target-request.v1",
             "runId": run_id,
+            "traceId": _trace_id(run_id, sample["id"]),
             "sampleId": sample["id"],
             "productId": dataset.product_id,
             "datasetId": dataset.dataset_id,
@@ -332,6 +420,7 @@ def _request_target(
         "Content-Type": "application/json",
         "X-MemOS-Eval-Run-ID": run_id,
         "X-MemOS-Quality-Pack-Sample-ID": sample["id"],
+        "X-MemOS-Eval-Trace-ID": _trace_id(run_id, sample["id"]),
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -369,7 +458,9 @@ def _request_target(
     return response_body
 
 
-def _live_item(sample: Mapping[str, Any], response_body: Mapping[str, Any]) -> dict[str, Any]:
+def _live_item(
+    sample: Mapping[str, Any], response_body: Mapping[str, Any], *, expected_trace_id: str
+) -> dict[str, Any]:
     expected_id = sample["id"]
     if response_body.get("sampleId") != expected_id:
         raise QualityPackError(f"live target sampleId 未绑定当前样本: expected={expected_id}")
@@ -386,6 +477,11 @@ def _live_item(sample: Mapping[str, Any], response_body: Mapping[str, Any]) -> d
         raise QualityPackError(f"live target 样本 {expected_id} 的 evidenceRefs 无效。")
     if len(evidence_refs) > MAX_EVIDENCE_REFS:
         raise QualityPackError(f"live target 样本 {expected_id} 的 evidenceRefs 过多。")
+    trace_id = response_body.get("traceId")
+    if trace_id != expected_trace_id:
+        raise QualityPackError(
+            f"live target traceId 未绑定当前样本: expected={expected_trace_id}"
+        )
     return {
         "id": expected_id,
         "status": "completed",
@@ -393,6 +489,7 @@ def _live_item(sample: Mapping[str, Any], response_body: Mapping[str, Any]) -> d
         "fixtureMatch": "pass",
         "evidenceRefCount": len(evidence_refs),
         "evidenceRefs": evidence_refs,
+        "traceId": trace_id,
         "targetOutput": target_output,
         "targetLatencyMs": _validate_optional_number(response_body.get("latencyMs"), "latencyMs"),
         "inputTokens": _validate_optional_number(
@@ -454,7 +551,13 @@ def run_live_evaluation(
             token=token,
             timeout_seconds=float(timeout_seconds),
         )
-        items.append(_live_item(sample, response_body))
+        items.append(
+            _live_item(
+                sample,
+                response_body,
+                expected_trace_id=_trace_id(run_id, sample["id"]),
+            )
+        )
     execution_duration_ms = round((time.perf_counter() - started_clock) * 1000, 3)
     count = len(items)
     latency_values = [
@@ -472,6 +575,8 @@ def run_live_evaluation(
             "fixtureMatchCount": count,
             "fixtureMatchRate": 1.0 if count else 0.0,
             "observedItemCount": count,
+            "observedTraceCount": sum(bool(item.get("traceId")) for item in items),
+            "traceCoverage": 1.0 if count and all(item.get("traceId") for item in items) else 0.0,
             "targetLatencyP95Ms": _p95(latency_values),
             "inputTokensTotal": sum(input_values)
             if all(value is not None for value in input_values)
@@ -499,6 +604,8 @@ def run_live_evaluation(
         "datasetVersion": dataset.version,
         "datasetStatus": dataset.status,
         "datasetContentHash": dataset.dataset_content_hash,
+        "sampleIds": list(dataset.sample_ids),
+        "traceId": run_id,
         "qualityProfileSha": quality_profile_sha,
         "target": {
             "adapter": "http-json-v1",
@@ -507,7 +614,11 @@ def run_live_evaluation(
             "promptVersion": prompt_version,
             "ragVersion": rag_version,
         },
-        "runner": {"id": RUNNER_ID, "version": RUNNER_VERSION},
+        "runner": {
+            "id": RUNNER_ID,
+            "version": RUNNER_VERSION,
+            "manifest": _runner_manifest("live"),
+        },
         "startedAt": started_at,
         "completedAt": _utc_now(),
         "executionDurationMs": execution_duration_ms,
@@ -517,15 +628,17 @@ def run_live_evaluation(
     }
     body = {
         "schemaVersion": REPORT_SCHEMA_VERSION,
-        "run": run,
-        "qualityPack": {
-            "manifestPath": dataset.manifest_path.as_posix(),
-            "manifestSha256": dataset.manifest_sha256,
-            "files": list(dataset.files),
+        "runner": {
+            "id": RUNNER_ID,
+            "version": RUNNER_VERSION,
+            "manifest": _runner_manifest("live"),
         },
+        "run": run,
+        "qualityPack": _quality_pack_block(dataset),
         "items": items,
         "scorecard": scorecard,
     }
+    body["evidence"] = _evidence_block(dataset, run_id=run_id, items=items)
     report_sha = _sha256(_canonical_json(body))
     body["report"] = {
         "format": "json",
@@ -567,6 +680,8 @@ def run_fixture_validation(
             "fixtureMatchRate": 1.0 if count else 0.0,
             "evaluatedItemCount": 0,
             "notAvailableItemCount": count,
+            "observedTraceCount": 0,
+            "traceCoverage": 0.0,
             "targetLatencyP50Ms": None,
             "targetLatencyP95Ms": None,
             "inputTokensTotal": None,
@@ -589,6 +704,8 @@ def run_fixture_validation(
         "datasetVersion": dataset.version,
         "datasetStatus": dataset.status,
         "datasetContentHash": dataset.dataset_content_hash,
+        "sampleIds": list(dataset.sample_ids),
+        "traceId": run_id,
         "qualityProfileSha": quality_profile_sha,
         "target": {
             "revision": target_revision,
@@ -596,7 +713,11 @@ def run_fixture_validation(
             "promptVersion": prompt_version,
             "ragVersion": rag_version,
         },
-        "runner": {"id": RUNNER_ID, "version": RUNNER_VERSION},
+        "runner": {
+            "id": RUNNER_ID,
+            "version": RUNNER_VERSION,
+            "manifest": _runner_manifest(mode),
+        },
         "startedAt": started_at,
         "completedAt": _utc_now(),
         "executionDurationMs": execution_duration_ms,
@@ -606,15 +727,17 @@ def run_fixture_validation(
     }
     body = {
         "schemaVersion": REPORT_SCHEMA_VERSION,
-        "run": run,
-        "qualityPack": {
-            "manifestPath": dataset.manifest_path.as_posix(),
-            "manifestSha256": dataset.manifest_sha256,
-            "files": list(dataset.files),
+        "runner": {
+            "id": RUNNER_ID,
+            "version": RUNNER_VERSION,
+            "manifest": _runner_manifest(mode),
         },
+        "run": run,
+        "qualityPack": _quality_pack_block(dataset),
         "items": items,
         "scorecard": scorecard,
     }
+    body["evidence"] = _evidence_block(dataset, run_id=run_id, items=items)
     report_sha = _sha256(_canonical_json(body))
     body["report"] = {
         "format": "json",
@@ -643,7 +766,9 @@ def _parser() -> argparse.ArgumentParser:
         description="MemOS Quality Pack shadow/mock/live EvaluationRun runner"
     )
     parser.add_argument("--quality-packs-root", required=True, type=Path)
-    parser.add_argument("--dataset-id", default="memos-golden-recall-v0")
+    parser.add_argument(
+        "--dataset-id", default="memos-golden-recall-v0-runner-20261017"
+    )
     parser.add_argument("--mode", choices=SUPPORTED_MODES, default="shadow")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--run-id")

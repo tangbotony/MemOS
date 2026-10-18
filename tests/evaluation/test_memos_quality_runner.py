@@ -79,6 +79,7 @@ def _fixture(tmp_path: Path, *, sample_count: int = 2) -> Path:
                 "lineCount": sample_count,
             }
         ],
+        "contentHash": hashlib.sha256(encoded).hexdigest(),
         "execution": {
             "runnerInput": "memories + query",
             "expectedOutput": "answer + evidenceRefs",
@@ -95,6 +96,8 @@ def test_loads_and_hashes_quality_pack(tmp_path: Path) -> None:
     dataset = load_quality_dataset(root, "memos-golden-recall-v0")
     assert len(dataset.samples) == 2
     assert len(dataset.dataset_content_hash) == 64
+    assert dataset.dataset_content_hash == dataset.files[0]["sha256"]
+    assert dataset.sample_ids == ("memos-fixture-1", "memos-fixture-2")
     assert dataset.files[0]["lineCount"] == 2
 
 
@@ -134,6 +137,21 @@ def test_rejects_hash_mismatch_and_unsafe_path(tmp_path: Path) -> None:
         load_quality_dataset(root, "memos-golden-recall-v0")
 
 
+def test_rejects_missing_or_unbound_manifest_content_hash(tmp_path: Path) -> None:
+    root = _fixture(tmp_path)
+    manifest_path = next(root.rglob("manifest.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("contentHash")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(QualityPackError, match="contentHash"):
+        load_quality_dataset(root, "memos-golden-recall-v0")
+
+    manifest["contentHash"] = "f" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(QualityPackError, match="contentHash"):
+        load_quality_dataset(root, "memos-golden-recall-v0")
+
+
 class _MockTargetHandler(BaseHTTPRequestHandler):
     calls: ClassVar[list[dict[str, Any]]] = []
     response_mode = "valid"
@@ -152,6 +170,7 @@ class _MockTargetHandler(BaseHTTPRequestHandler):
             sample_id = "unexpected-sample"
         response = {
             "sampleId": sample_id,
+            "traceId": f"{payload['runId']}:{payload['sampleId']}",
             "targetOutput": f"answer for {payload['query']}",
             "evidenceRefs": [f"target:{sample_id}:1"],
             "latencyMs": 12.5,
@@ -159,6 +178,8 @@ class _MockTargetHandler(BaseHTTPRequestHandler):
             "outputTokens": 9,
             "costMicros": 3,
         }
+        if self.response_mode == "trace-mismatch":
+            response["traceId"] = "unexpected-trace"
         if self.response_mode == "missing-observability":
             response.pop("latencyMs")
             response.pop("inputTokens")
@@ -231,11 +252,20 @@ def test_live_runner_calls_explicit_target_and_keeps_observability_fields(
     assert all(item["inputTokens"] == 7 for item in report["items"])
     assert all(item["outputTokens"] == 9 for item in report["items"])
     assert all(item["costMicros"] == 3 for item in report["items"])
+    assert all(item["traceId"].endswith(item["id"]) for item in report["items"])
     assert len(handler.calls) == 2
     assert all(call["authorization"] == "Bearer local-only-token" for call in handler.calls)
     assert all("goldenAnswer" not in call["payload"] for call in handler.calls)
     serialized = json.dumps(report, ensure_ascii=False)
     assert "local-only-token" not in serialized
+    assert report["qualityPack"]["contentHash"] == dataset.dataset_content_hash
+    assert report["qualityPack"]["sampleIds"] == list(dataset.sample_ids)
+    assert report["runner"]["manifest"]["networkRequired"] is True
+    assert report["runner"]["manifest"]["outputContract"] == "badcase://evaluation-run/per-sample-v1"
+    assert report["evidence"]["datasetId"] == dataset.dataset_id
+    assert report["evidence"]["datasetContentHash"] == dataset.dataset_content_hash
+    assert report["evidence"]["sampleIds"] == list(dataset.sample_ids)
+    assert report["evidence"]["observedTraceCount"] == 2
 
 
 def test_live_runner_fails_closed_on_sample_binding_error(
@@ -251,6 +281,23 @@ def test_live_runner_fails_closed_on_sample_binding_error(
             target_url=f"http://127.0.0.1:{server.server_port}/evaluate",
             token_env="MEMOS_TEST_EVAL_TOKEN",
             timeout_seconds=2,
+        )
+
+
+def test_live_runner_fails_closed_on_trace_binding_error(
+    tmp_path: Path, mock_target: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, handler = mock_target
+    handler.response_mode = "trace-mismatch"
+    monkeypatch.setenv("MEMOS_TEST_EVAL_TOKEN", "local-only-token")
+    dataset = load_quality_dataset(_fixture(tmp_path), "memos-golden-recall-v0")
+    with pytest.raises(QualityPackError, match="traceId"):
+        run_live_evaluation(
+            dataset,
+            target_url=f"http://127.0.0.1:{server.server_port}/evaluate",
+            token_env="MEMOS_TEST_EVAL_TOKEN",
+            timeout_seconds=2,
+            run_id="eval-live-test",
         )
 
 
